@@ -44,6 +44,9 @@ DB_PATH = os.getenv("DB_PATH", "students.db")
 CURRICULUM_FILE = os.getenv("CURRICULUM_FILE", "curriculum.pdf")
 LOGO_FILE = os.getenv("LOGO_FILE", "logo.png")
 WHATSAPP_LINK = os.getenv("WHATSAPP_LINK", "")
+BOT_USERNAME = os.getenv("BOT_USERNAME", "")
+BONUS_FILE = os.getenv("BONUS_FILE", "bonus.pdf")
+REFERRAL_BONUS_THRESHOLD = int(os.getenv("REFERRAL_BONUS_THRESHOLD", "3"))
 TZ = ZoneInfo("Africa/Lagos")
 
 NAME, AGE, PHONE, EMAIL, FOUND_US, GOAL, MOTIVATION, CATEGORY = range(8)
@@ -79,6 +82,13 @@ def init_db():
             );
             """
         )
+        # safe additive migration for referral tracking (won't error on an
+        # already-populated live database that predates these columns)
+        cols = {r["name"] for r in c.execute("PRAGMA table_info(students)").fetchall()}
+        if "referred_by" not in cols:
+            c.execute("ALTER TABLE students ADD COLUMN referred_by TEXT")
+        if "bonus_sent" not in cols:
+            c.execute("ALTER TABLE students ADD COLUMN bonus_sent INTEGER DEFAULT 0")
 
 
 def get_student(uid):
@@ -97,11 +107,26 @@ def now():
     return datetime.now(TZ)
 
 
+def referral_count(student_no):
+    with db() as c:
+        return c.execute(
+            "SELECT COUNT(*) n FROM students WHERE referred_by=? COLLATE NOCASE",
+            (student_no,),
+        ).fetchone()["n"]
+
+
 # ---------- registration form ----------
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     if ctx.args:
-        ctx.user_data["source"] = ctx.args[0][:40]
+        payload = ctx.args[0][:60]
+        if payload.startswith("ref_"):
+            ref_no = payload[4:].strip()
+            if get_student_by_no(ref_no):
+                ctx.user_data["referred_by"] = ref_no
+                ctx.user_data["source"] = f"referral:{ref_no}"
+        else:
+            ctx.user_data["source"] = payload
     s = get_student(uid)
     if s:
         await update.message.reply_text(
@@ -204,17 +229,19 @@ async def got_category(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     u = q.from_user
     d = ctx.user_data
 
+    referred_by = d.get("referred_by")
     with db() as c:
         next_no = c.execute("SELECT COUNT(*) n FROM students").fetchone()["n"] + 1
         student_no = f"HB-{next_no:04d}"
         c.execute(
             """INSERT OR REPLACE INTO students
                (user_id, username, name, age, phone, email, found_us, goal, motivation,
-                category, source, plan, student_no, status, paid_amount, registered_at)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,NULL,?,'registered',0,?)""",
+                category, source, plan, student_no, status, paid_amount, registered_at,
+                referred_by, bonus_sent)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,NULL,?,'registered',0,?,?,0)""",
             (u.id, u.username, d["name"], d["age"], d["phone"], d["email"],
              d["found_us"], d["goal"], d["motivation"], cat,
-             d.get("source", "direct"), student_no, now().isoformat()),
+             d.get("source", "direct"), student_no, now().isoformat(), referred_by),
         )
 
     await q.edit_message_text(f"Got it — {cat}. ✅")
@@ -244,7 +271,39 @@ async def got_category(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await ctx.bot.send_message(
         u.id, f"Good luck, {d['name']} — we're rooting for you already. See you soon! 🎉"
     )
+
+    if referred_by:
+        await maybe_send_referral_bonus(ctx, referred_by)
+
     return ConversationHandler.END
+
+
+async def maybe_send_referral_bonus(ctx, referrer_no):
+    referrer = get_student_by_no(referrer_no)
+    if not referrer:
+        return
+    count = referral_count(referrer_no)
+    if referrer["bonus_sent"] or count < REFERRAL_BONUS_THRESHOLD:
+        return
+    with db() as c:
+        c.execute("UPDATE students SET bonus_sent=1 WHERE student_no=?", (referrer_no,))
+    try:
+        if os.path.exists(BONUS_FILE):
+            with open(BONUS_FILE, "rb") as f:
+                await ctx.bot.send_document(
+                    referrer["user_id"], f, filename=os.path.basename(BONUS_FILE),
+                    caption=(
+                        f"🎁 You brought in {count} people — thank you! Here's your referral "
+                        "bonus, as promised."
+                    ),
+                )
+        else:
+            await ctx.bot.send_message(
+                referrer["user_id"],
+                f"🎁 You've brought in {count} people — your referral bonus is on its way from the team!",
+            )
+    except Exception as e:
+        log.warning("Could not send referral bonus to %s: %s", referrer["user_id"], e)
 
 
 async def send_curriculum_to(ctx, uid):
@@ -447,12 +506,64 @@ async def id_cmd(update, ctx):
         log.warning("Could not generate ID card: %s", e)
 
 
+async def refer_cmd(update, ctx):
+    uid = update.effective_user.id
+    s = get_student(uid)
+    if not s:
+        await update.message.reply_text("You're not registered yet. Send /start.")
+        return
+    count = referral_count(s["student_no"])
+    remaining = max(0, REFERRAL_BONUS_THRESHOLD - count)
+    if not BOT_USERNAME:
+        await update.message.reply_text(
+            "Your referral tracking is set up, but the bot's link isn't configured yet — "
+            "let the team know."
+        )
+        return
+    link = f"https://t.me/{BOT_USERNAME}?start=ref_{s['student_no']}"
+    lines = [
+        f"🔗 Your personal referral link:\n{link}",
+        "",
+        "Share it with friends — when someone registers through it, it counts as your referral.",
+        "",
+        f"You've referred {count} so far.",
+    ]
+    if s["bonus_sent"]:
+        lines.append("🎁 You've already unlocked and received your referral bonus. Thank you!")
+    else:
+        lines.append(
+            f"Refer {remaining} more to unlock a free bonus resource "
+            f"(at {REFERRAL_BONUS_THRESHOLD} total referrals)."
+        )
+    await update.message.reply_text("\n".join(lines))
+
+
+async def leaderboard_cmd(update, ctx):
+    with db() as c:
+        rows = c.execute(
+            """SELECT referred_by, COUNT(*) n FROM students
+               WHERE referred_by IS NOT NULL AND referred_by != ''
+               GROUP BY referred_by COLLATE NOCASE ORDER BY n DESC LIMIT 10"""
+        ).fetchall()
+    if not rows:
+        await update.message.reply_text("No referrals yet — be the first! Use /refer to get your link.")
+        return
+    lines = ["🏆 Referral leaderboard:", ""]
+    for i, r in enumerate(rows, 1):
+        ref = get_student_by_no(r["referred_by"])
+        name = ref["name"] if ref else r["referred_by"]
+        lines.append(f"{i}. {name} — {r['n']} referral{'s' if r['n'] != 1 else ''}")
+    await update.message.reply_text("\n".join(lines))
+
+
 async def help_cmd(update, ctx):
     text = (
         "/start - register\n/pay - payment details\n/status - your payment status"
         "\n/curriculum - get the training curriculum (PDF)"
         "\n/id - get your student ID card"
         "\n/certificate - get your completion certificate (once eligible)"
+        "\n/refer - get your referral link and see your referral count"
+        "\n/leaderboard - see the top referrers"
     )
     if update.effective_user.id in ADMIN_IDS:
         text += (
@@ -620,6 +731,8 @@ def main():
     app.add_handler(CommandHandler("certificate", certificate_cmd))
     app.add_handler(CommandHandler("status", status_cmd))
     app.add_handler(CommandHandler("help", help_cmd))
+    app.add_handler(CommandHandler("refer", refer_cmd))
+    app.add_handler(CommandHandler("leaderboard", leaderboard_cmd))
     app.add_handler(CommandHandler("stats", stats))
     app.add_handler(CommandHandler("export", export))
     app.add_handler(CommandHandler("complete", complete_cmd))
