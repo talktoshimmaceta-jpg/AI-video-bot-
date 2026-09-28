@@ -15,6 +15,8 @@ from telegram import (
     ReplyKeyboardRemove,
     Update,
 )
+
+import cards
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -64,9 +66,11 @@ def init_db():
                 username TEXT, name TEXT, age TEXT, phone TEXT, email TEXT,
                 found_us TEXT, goal TEXT, motivation TEXT,
                 category TEXT, source TEXT, plan TEXT,
+                student_no TEXT,
                 status TEXT DEFAULT 'registered',
                 paid_amount INTEGER DEFAULT 0,
-                registered_at TEXT, second_due TEXT, last_reminded TEXT
+                registered_at TEXT, second_due TEXT, last_reminded TEXT,
+                completed_at TEXT
             );
             CREATE TABLE IF NOT EXISTS payments (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -175,57 +179,75 @@ async def got_goal(update, ctx):
 
 async def got_motivation(update, ctx):
     ctx.user_data["motivation"] = update.message.text.strip()[:800]
-    kb = ReplyKeyboardMarkup([[c] for c in CATEGORIES], one_time_keyboard=True, resize_keyboard=True)
-    await update.message.reply_text("Which best describes you?", reply_markup=kb)
+    kb = InlineKeyboardMarkup(
+        [[InlineKeyboardButton(c, callback_data=f"cat:{i}")] for i, c in enumerate(CATEGORIES)]
+    )
+    await update.message.reply_text(
+        "Which best describes you?", reply_markup=kb
+    )
     return CATEGORY
 
 
-async def got_category(update, ctx):
-    cat = update.message.text.strip()
-    if cat not in CATEGORIES:
-        await update.message.reply_text("Please pick one of the options.")
-        return CATEGORY
+async def got_category(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    idx = int(q.data.split(":")[1])
+    cat = CATEGORIES[idx]
     ctx.user_data["category"] = cat
-    u = update.effective_user
+    u = q.from_user
     d = ctx.user_data
+
     with db() as c:
+        next_no = c.execute("SELECT COUNT(*) n FROM students").fetchone()["n"] + 1
+        student_no = f"HB-{next_no:04d}"
         c.execute(
             """INSERT OR REPLACE INTO students
                (user_id, username, name, age, phone, email, found_us, goal, motivation,
-                category, source, plan, status, paid_amount, registered_at)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,NULL,'registered',0,?)""",
+                category, source, plan, student_no, status, paid_amount, registered_at)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,NULL,?,'registered',0,?)""",
             (u.id, u.username, d["name"], d["age"], d["phone"], d["email"],
-             d["found_us"], d["goal"], d["motivation"], d["category"],
-             d.get("source", "direct"), now().isoformat()),
+             d["found_us"], d["goal"], d["motivation"], cat,
+             d.get("source", "direct"), student_no, now().isoformat()),
         )
-    await update.message.reply_text(
+
+    await q.edit_message_text(f"Got it — {cat}. ✅")
+
+    await ctx.bot.send_message(
+        u.id,
         f"Thank you, {d['name']} — that means a lot, and we can already tell you're serious "
         f"about this. Welcome to the {PROGRAM}! 🎬\n\n"
-        "Here's our full curriculum so you can see exactly what you'll be learning, "
-        "week by week.",
-        reply_markup=ReplyKeyboardRemove(),
+        "Here's your student ID card and our full curriculum.",
     )
-    await send_curriculum(update.message, ctx)
+
+    try:
+        id_card = cards.generate_id_card(d["name"], cat, student_no, PROGRAM)
+        await ctx.bot.send_photo(u.id, id_card, caption=f"🪪 Your student ID — {student_no}")
+    except Exception as e:
+        log.warning("Could not generate/send ID card: %s", e)
+
+    await send_curriculum_to(ctx, u.id)
 
     if WHATSAPP_LINK:
-        await update.message.reply_text(
+        await ctx.bot.send_message(
+            u.id,
             "Join our WhatsApp community here — this is where announcements, class links "
-            f"and updates will be shared:\n\n{WHATSAPP_LINK}"
+            f"and updates will be shared:\n\n{WHATSAPP_LINK}",
         )
 
-    await update.message.reply_text(
-        f"Good luck, {d['name']} — we're rooting for you already. See you soon! 🎉"
+    await ctx.bot.send_message(
+        u.id, f"Good luck, {d['name']} — we're rooting for you already. See you soon! 🎉"
     )
     return ConversationHandler.END
 
 
-async def send_curriculum(message, ctx):
+async def send_curriculum_to(ctx, uid):
     if not os.path.exists(CURRICULUM_FILE):
         log.warning("Curriculum file not found at %s", CURRICULUM_FILE)
         return
     try:
         with open(CURRICULUM_FILE, "rb") as f:
-            await message.reply_document(
+            await ctx.bot.send_document(
+                uid,
                 f,
                 filename="Curriculum.pdf",
                 caption="📄 Your training curriculum — take a look and see everything you'll be learning.",
@@ -235,7 +257,7 @@ async def send_curriculum(message, ctx):
 
 
 async def curriculum_cmd(update, ctx):
-    await send_curriculum(update.message, ctx)
+    await send_curriculum_to(ctx, update.effective_user.id)
 
 
 async def cancel(update, ctx):
@@ -386,13 +408,50 @@ async def status_cmd(update, ctx):
     )
 
 
+async def certificate_cmd(update, ctx):
+    s = get_student(update.effective_user.id)
+    if not s:
+        await update.message.reply_text("You're not registered yet. Send /start.")
+        return
+    if s["status"] != "completed":
+        await update.message.reply_text(
+            "Your certificate unlocks once you've completed the training — hang tight, "
+            "your instructor will mark you as done at the end of the program."
+        )
+        return
+    try:
+        date_str = datetime.fromisoformat(s["completed_at"]).strftime("%d %b %Y") if s["completed_at"] else now().strftime("%d %b %Y")
+        cert = cards.generate_certificate(s["name"], PROGRAM, date_str)
+        await update.message.reply_photo(cert, caption="🎓 Congratulations! Here's your certificate.")
+    except Exception as e:
+        log.warning("Could not generate certificate: %s", e)
+        await update.message.reply_text("Sorry, something went wrong generating your certificate. Try again shortly.")
+
+
+async def id_cmd(update, ctx):
+    s = get_student(update.effective_user.id)
+    if not s:
+        await update.message.reply_text("You're not registered yet. Send /start.")
+        return
+    try:
+        id_card = cards.generate_id_card(s["name"], s["category"], s["student_no"] or "HB-0000", PROGRAM)
+        await update.message.reply_photo(id_card, caption=f"🪪 Your student ID — {s['student_no']}")
+    except Exception as e:
+        log.warning("Could not generate ID card: %s", e)
+
+
 async def help_cmd(update, ctx):
     text = (
         "/start - register\n/pay - payment details\n/status - your payment status"
         "\n/curriculum - get the training curriculum (PDF)"
+        "\n/id - get your student ID card"
+        "\n/certificate - get your completion certificate (once eligible)"
     )
     if update.effective_user.id in ADMIN_IDS:
-        text += "\n\nAdmin:\n/stats\n/export\n/broadcast <all|unpaid|paid> <message>"
+        text += (
+            "\n\nAdmin:\n/stats\n/export\n/broadcast <all|unpaid|paid> <message>"
+            "\n/complete <telegram_id> - mark a student as completed and send their certificate"
+        )
     await update.message.reply_text(text)
 
 
@@ -439,6 +498,37 @@ async def export(update, ctx):
     data = io.BytesIO(buf.getvalue().encode())
     data.name = "students.csv"
     await update.message.reply_document(data)
+
+
+@admin_only
+async def complete_cmd(update, ctx):
+    if not ctx.args:
+        await update.message.reply_text("Usage: /complete <telegram_id>")
+        return
+    try:
+        uid = int(ctx.args[0])
+    except ValueError:
+        await update.message.reply_text("That doesn't look like a valid Telegram ID.")
+        return
+    s = get_student(uid)
+    if not s:
+        await update.message.reply_text("No student found with that ID.")
+        return
+    with db() as c:
+        c.execute(
+            "UPDATE students SET status='completed', completed_at=? WHERE user_id=?",
+            (now().isoformat(), uid),
+        )
+    try:
+        cert = cards.generate_certificate(s["name"], PROGRAM, now().strftime("%d %b %Y"))
+        await ctx.bot.send_photo(
+            uid, cert,
+            caption="🎓 Congratulations — you've completed the program! Here's your certificate."
+        )
+        await update.message.reply_text(f"Marked {s['name']} as completed and sent their certificate.")
+    except Exception as e:
+        log.warning("Could not send certificate to %s: %s", uid, e)
+        await update.message.reply_text(f"Marked {s['name']} as completed, but sending the certificate failed.")
 
 
 @admin_only
@@ -504,17 +594,20 @@ def main():
             FOUND_US: [MessageHandler(filters.TEXT & ~filters.COMMAND, got_found_us)],
             GOAL: [MessageHandler(filters.TEXT & ~filters.COMMAND, got_goal)],
             MOTIVATION: [MessageHandler(filters.TEXT & ~filters.COMMAND, got_motivation)],
-            CATEGORY: [MessageHandler(filters.TEXT & ~filters.COMMAND, got_category)],
+            CATEGORY: [CallbackQueryHandler(got_category, pattern=r"^cat:\d+$")],
         },
         fallbacks=[CommandHandler("cancel", cancel)],
     )
     app.add_handler(form)
     app.add_handler(CommandHandler("pay", pay_cmd))
     app.add_handler(CommandHandler("curriculum", curriculum_cmd))
+    app.add_handler(CommandHandler("id", id_cmd))
+    app.add_handler(CommandHandler("certificate", certificate_cmd))
     app.add_handler(CommandHandler("status", status_cmd))
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("stats", stats))
     app.add_handler(CommandHandler("export", export))
+    app.add_handler(CommandHandler("complete", complete_cmd))
     app.add_handler(CommandHandler("broadcast", broadcast))
     app.add_handler(CallbackQueryHandler(review_payment, pattern=r"^(ap|rj):\d+$"))
     app.add_handler(CallbackQueryHandler(choose_plan, pattern=r"^plan:(full|two)$"))
