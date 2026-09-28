@@ -86,6 +86,13 @@ def get_student(uid):
         return c.execute("SELECT * FROM students WHERE user_id=?", (uid,)).fetchone()
 
 
+def get_student_by_no(student_no):
+    with db() as c:
+        return c.execute(
+            "SELECT * FROM students WHERE student_no=? COLLATE NOCASE", (student_no,)
+        ).fetchone()
+
+
 def now():
     return datetime.now(TZ)
 
@@ -503,17 +510,25 @@ async def export(update, ctx):
 @admin_only
 async def complete_cmd(update, ctx):
     if not ctx.args:
-        await update.message.reply_text("Usage: /complete <telegram_id>")
+        await update.message.reply_text(
+            "Usage: /complete <student ID>\nExample: /complete HB-0001\n\n"
+            "(A raw Telegram ID also still works, if you ever have one.)"
+        )
         return
-    try:
-        uid = int(ctx.args[0])
-    except ValueError:
-        await update.message.reply_text("That doesn't look like a valid Telegram ID.")
-        return
-    s = get_student(uid)
+    arg = ctx.args[0].strip()
+    s = get_student_by_no(arg)
     if not s:
-        await update.message.reply_text("No student found with that ID.")
+        # fall back to a raw numeric Telegram ID, for backwards compatibility
+        try:
+            s = get_student(int(arg))
+        except ValueError:
+            s = None
+    if not s:
+        await update.message.reply_text(
+            f"No student found with ID {arg}. Check /stats or /export for the right student ID (e.g. HB-0001)."
+        )
         return
+    uid = s["user_id"]
     with db() as c:
         c.execute(
             "UPDATE students SET status='completed', completed_at=? WHERE user_id=?",
@@ -525,10 +540,10 @@ async def complete_cmd(update, ctx):
             uid, cert,
             caption="🎓 Congratulations — you've completed the program! Here's your certificate."
         )
-        await update.message.reply_text(f"Marked {s['name']} as completed and sent their certificate.")
+        await update.message.reply_text(f"Marked {s['name']} ({s['student_no']}) as completed and sent their certificate.")
     except Exception as e:
         log.warning("Could not send certificate to %s: %s", uid, e)
-        await update.message.reply_text(f"Marked {s['name']} as completed, but sending the certificate failed.")
+        await update.message.reply_text(f"Marked {s['name']} ({s['student_no']}) as completed, but sending the certificate failed.")
 
 
 @admin_only
