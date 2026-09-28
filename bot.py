@@ -45,8 +45,8 @@ CURRICULUM_FILE = os.getenv("CURRICULUM_FILE", "curriculum.pdf")
 LOGO_FILE = os.getenv("LOGO_FILE", "logo.png")
 WHATSAPP_LINK = os.getenv("WHATSAPP_LINK", "")
 BOT_USERNAME = os.getenv("BOT_USERNAME", "")
-BONUS_FILE = os.getenv("BONUS_FILE", "bonus.pdf")
 REFERRAL_BONUS_THRESHOLD = int(os.getenv("REFERRAL_BONUS_THRESHOLD", "3"))
+REFERRAL_FREE_ACCESS_CAP = int(os.getenv("REFERRAL_FREE_ACCESS_CAP", "20"))
 TZ = ZoneInfo("Africa/Lagos")
 
 NAME, AGE, PHONE, EMAIL, FOUND_US, GOAL, MOTIVATION, CATEGORY = range(8)
@@ -280,30 +280,48 @@ async def got_category(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def maybe_send_referral_bonus(ctx, referrer_no):
     referrer = get_student_by_no(referrer_no)
-    if not referrer:
+    if not referrer or referrer["bonus_sent"]:
         return
     count = referral_count(referrer_no)
-    if referrer["bonus_sent"] or count < REFERRAL_BONUS_THRESHOLD:
+    if count < REFERRAL_BONUS_THRESHOLD:
         return
+
+    # first time this referrer crosses the threshold — decide now, once,
+    # whether a free-access slot is still available
     with db() as c:
-        c.execute("UPDATE students SET bonus_sent=1 WHERE student_no=?", (referrer_no,))
-    try:
-        if os.path.exists(BONUS_FILE):
-            with open(BONUS_FILE, "rb") as f:
-                await ctx.bot.send_document(
-                    referrer["user_id"], f, filename=os.path.basename(BONUS_FILE),
-                    caption=(
-                        f"🎁 You brought in {count} people — thank you! Here's your referral "
-                        "bonus, as promised."
-                    ),
-                )
-        else:
+        granted_so_far = c.execute(
+            "SELECT COUNT(*) n FROM students WHERE bonus_sent=1"
+        ).fetchone()["n"]
+
+    if granted_so_far < REFERRAL_FREE_ACCESS_CAP:
+        with db() as c:
+            c.execute(
+                "UPDATE students SET bonus_sent=1, status='paid', paid_amount=?, second_due=NULL WHERE student_no=?",
+                (PRICE_FULL, referrer_no),
+            )
+        link = CLASS_LINK_2 or CLASS_LINK
+        msg = (
+            f"🎉 Amazing — you've referred {count} people! That earns you FREE full access "
+            f"to the {PROGRAM}, no payment needed. You're all set."
+        )
+        if link:
+            msg += f"\n\nHere's your class link:\n{link}"
+        try:
+            await ctx.bot.send_message(referrer["user_id"], msg)
+        except Exception as e:
+            log.warning("Could not notify %s of free access: %s", referrer["user_id"], e)
+    else:
+        with db() as c:
+            c.execute("UPDATE students SET bonus_sent=1 WHERE student_no=?", (referrer_no,))
+        try:
             await ctx.bot.send_message(
                 referrer["user_id"],
-                f"🎁 You've brought in {count} people — your referral bonus is on its way from the team!",
+                f"You've referred {count} people — thank you so much for spreading the word! "
+                f"All {REFERRAL_FREE_ACCESS_CAP} free-access slots have already been claimed by "
+                "earlier referrers, but we really appreciate you.",
             )
-    except Exception as e:
-        log.warning("Could not send referral bonus to %s: %s", referrer["user_id"], e)
+        except Exception as e:
+            log.warning("Could not notify %s of referral cap: %s", referrer["user_id"], e)
 
 
 async def send_curriculum_to(ctx, uid):
@@ -529,11 +547,14 @@ async def refer_cmd(update, ctx):
         f"You've referred {count} so far.",
     ]
     if s["bonus_sent"]:
-        lines.append("🎁 You've already unlocked and received your referral bonus. Thank you!")
+        if s["status"] == "paid" and s["paid_amount"] >= PRICE_FULL:
+            lines.append("🎉 You've already unlocked FREE full access. Thank you for spreading the word!")
+        else:
+            lines.append("You crossed the referral threshold, but all free-access slots were already taken. Thank you regardless!")
     else:
         lines.append(
-            f"Refer {remaining} more to unlock a free bonus resource "
-            f"(at {REFERRAL_BONUS_THRESHOLD} total referrals)."
+            f"Refer {remaining} more (at {REFERRAL_BONUS_THRESHOLD} total) to unlock FREE full "
+            f"access — limited to the first {REFERRAL_FREE_ACCESS_CAP} people who qualify."
         )
     await update.message.reply_text("\n".join(lines))
 
