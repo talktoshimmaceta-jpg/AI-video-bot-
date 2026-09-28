@@ -214,8 +214,7 @@ async def got_category(update, ctx):
         )
 
     await update.message.reply_text(
-        f"Good luck, {d['name']} — we're rooting for you already. See you soon! 🎉\n\n"
-        "When you're ready to secure your seat, just send /pay right here in this chat."
+        f"Good luck, {d['name']} — we're rooting for you already. See you soon! 🎉"
     )
     return ConversationHandler.END
 
