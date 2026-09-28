@@ -228,7 +228,7 @@ async def send_curriculum(message, ctx):
             await message.reply_document(
                 f,
                 filename="Curriculum.pdf",
-                caption="📄 Your training curriculum — take a look before you pay.",
+                caption="📄 Your training curriculum — take a look and see everything you'll be learning.",
             )
     except Exception as e:
         log.warning("Could not send curriculum: %s", e)
