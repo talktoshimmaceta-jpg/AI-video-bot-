@@ -39,9 +39,11 @@ PAY_LINK = os.getenv("PAY_LINK", "")
 CLASS_LINK = os.getenv("CLASS_LINK", "")
 CLASS_LINK_2 = os.getenv("CLASS_LINK_2", "")
 DB_PATH = os.getenv("DB_PATH", "students.db")
+CURRICULUM_FILE = os.getenv("CURRICULUM_FILE", "curriculum.pdf")
+LOGO_FILE = os.getenv("LOGO_FILE", "logo.png")
 TZ = ZoneInfo("Africa/Lagos")
 
-NAME, PHONE, EMAIL, CATEGORY, PLAN = range(5)
+NAME, AGE, PHONE, EMAIL, FOUND_US, GOAL, MOTIVATION, CATEGORY, PLAN = range(9)
 CATEGORIES = ["Student", "Business owner", "Knowledge seeker", "Income seeker"]
 
 
@@ -58,7 +60,8 @@ def init_db():
             """
             CREATE TABLE IF NOT EXISTS students (
                 user_id INTEGER PRIMARY KEY,
-                username TEXT, name TEXT, phone TEXT, email TEXT,
+                username TEXT, name TEXT, age TEXT, phone TEXT, email TEXT,
+                found_us TEXT, goal TEXT, motivation TEXT,
                 category TEXT, source TEXT, plan TEXT,
                 status TEXT DEFAULT 'registered',
                 paid_amount INTEGER DEFAULT 0,
@@ -93,8 +96,21 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             f"Welcome back, {s['name']}! Use /pay to make a payment, /status to check your status, or /help.",
         )
         return ConversationHandler.END
+
+    if os.path.exists(LOGO_FILE):
+        try:
+            with open(LOGO_FILE, "rb") as f:
+                await update.message.reply_photo(f)
+        except Exception as e:
+            log.warning("Could not send logo: %s", e)
+
     await update.message.reply_text(
-        f"Welcome to the {PROGRAM}! \n\nLet's get you registered. It takes about a minute.\n\nWhat is your full name?",
+        f"Welcome to the {PROGRAM}! 🎬\n\n"
+        "Before anything else, we'd like to get to know you properly — this isn't just a "
+        "mailing list signup, it's a short application so we understand who's joining us "
+        "and can support you better.\n\n"
+        "It's about a dozen questions and takes 2–3 minutes. Let's start:\n\n"
+        "What's your full name?",
         reply_markup=ReplyKeyboardRemove(),
     )
     return NAME
@@ -102,6 +118,17 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def got_name(update, ctx):
     ctx.user_data["name"] = update.message.text.strip()[:80]
+    await update.message.reply_text("How old are you?")
+    return AGE
+
+
+async def got_age(update, ctx):
+    age = update.message.text.strip()
+    digits = "".join(ch for ch in age if ch.isdigit())
+    if not digits or not (10 <= int(digits) <= 100):
+        await update.message.reply_text("Please enter a valid age (just the number).")
+        return AGE
+    ctx.user_data["age"] = digits
     await update.message.reply_text("Your WhatsApp / phone number?")
     return PHONE
 
@@ -122,6 +149,31 @@ async def got_email(update, ctx):
         await update.message.reply_text("That doesn't look like a valid email. Please try again.")
         return EMAIL
     ctx.user_data["email"] = email
+    await update.message.reply_text(
+        "How did you hear about us? (e.g. a friend, a particular blog/page, Instagram, etc.)"
+    )
+    return FOUND_US
+
+
+async def got_found_us(update, ctx):
+    ctx.user_data["found_us"] = update.message.text.strip()[:200]
+    await update.message.reply_text(
+        "What specifically do you want to learn or be able to do by the end of this training?"
+    )
+    return GOAL
+
+
+async def got_goal(update, ctx):
+    ctx.user_data["goal"] = update.message.text.strip()[:500]
+    await update.message.reply_text(
+        "Last one before the multiple choice — tell us a bit about yourself: what do you "
+        "currently do, and why does this training matter to you right now?"
+    )
+    return MOTIVATION
+
+
+async def got_motivation(update, ctx):
+    ctx.user_data["motivation"] = update.message.text.strip()[:800]
     kb = ReplyKeyboardMarkup([[c] for c in CATEGORIES], one_time_keyboard=True, resize_keyboard=True)
     await update.message.reply_text("Which best describes you?", reply_markup=kb)
     return CATEGORY
@@ -133,12 +185,34 @@ async def got_category(update, ctx):
         await update.message.reply_text("Please pick one of the options.")
         return CATEGORY
     ctx.user_data["category"] = cat
+    u = update.effective_user
+    d = ctx.user_data
+    with db() as c:
+        c.execute(
+            """INSERT OR REPLACE INTO students
+               (user_id, username, name, age, phone, email, found_us, goal, motivation,
+                category, source, plan, status, paid_amount, registered_at)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,NULL,'registered',0,?)""",
+            (u.id, u.username, d["name"], d["age"], d["phone"], d["email"],
+             d["found_us"], d["goal"], d["motivation"], d["category"],
+             d.get("source", "direct"), now().isoformat()),
+        )
+    await update.message.reply_text(
+        f"Thank you, {d['name']} — that means a lot, and we can already tell you're serious "
+        f"about this. Welcome to the {PROGRAM}! 🎬\n\n"
+        "Here's our full curriculum so you can see exactly what you'll be learning, "
+        "week by week.",
+        reply_markup=ReplyKeyboardRemove(),
+    )
+    await send_curriculum(update.message, ctx)
     kb = ReplyKeyboardMarkup(
         [[f"Pay in full (N{PRICE_FULL:,})"], [f"Two instalments (N{PRICE_HALF:,} + N{PRICE_HALF:,})"]],
         one_time_keyboard=True,
         resize_keyboard=True,
     )
-    await update.message.reply_text("How would you like to pay?", reply_markup=kb)
+    await update.message.reply_text(
+        "Now let's secure your seat — how would you like to pay?", reply_markup=kb
+    )
     return PLAN
 
 
@@ -151,21 +225,31 @@ async def got_plan(update, ctx):
     else:
         await update.message.reply_text("Please pick one of the two options.")
         return PLAN
-    u = update.effective_user
-    d = ctx.user_data
+    uid = update.effective_user.id
     with db() as c:
-        c.execute(
-            """INSERT OR REPLACE INTO students
-               (user_id, username, name, phone, email, category, source, plan, status, paid_amount, registered_at)
-               VALUES (?,?,?,?,?,?,?,?, 'registered', 0, ?)""",
-            (u.id, u.username, d["name"], d["phone"], d["email"], d["category"],
-             d.get("source", "direct"), plan, now().isoformat()),
-        )
-    await update.message.reply_text(
-        "You're registered! Now let's secure your seat.", reply_markup=ReplyKeyboardRemove()
-    )
-    await send_payment_instructions(update.message, ctx, u.id)
+        c.execute("UPDATE students SET plan=? WHERE user_id=?", (plan, uid))
+    await update.message.reply_text("Great choice.", reply_markup=ReplyKeyboardRemove())
+    await send_payment_instructions(update.message, ctx, uid)
     return ConversationHandler.END
+
+
+async def send_curriculum(message, ctx):
+    if not os.path.exists(CURRICULUM_FILE):
+        log.warning("Curriculum file not found at %s", CURRICULUM_FILE)
+        return
+    try:
+        with open(CURRICULUM_FILE, "rb") as f:
+            await message.reply_document(
+                f,
+                filename="Curriculum.pdf",
+                caption="📄 Your training curriculum — take a look before you pay.",
+            )
+    except Exception as e:
+        log.warning("Could not send curriculum: %s", e)
+
+
+async def curriculum_cmd(update, ctx):
+    await send_curriculum(update.message, ctx)
 
 
 async def cancel(update, ctx):
@@ -294,7 +378,10 @@ async def status_cmd(update, ctx):
 
 
 async def help_cmd(update, ctx):
-    text = "/start - register\n/pay - payment details\n/status - your payment status"
+    text = (
+        "/start - register\n/pay - payment details\n/status - your payment status"
+        "\n/curriculum - get the training curriculum (PDF)"
+    )
     if update.effective_user.id in ADMIN_IDS:
         text += "\n\nAdmin:\n/stats\n/export\n/broadcast <all|unpaid|paid> <message>"
     await update.message.reply_text(text)
@@ -402,8 +489,12 @@ def main():
         entry_points=[CommandHandler("start", start)],
         states={
             NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, got_name)],
+            AGE: [MessageHandler(filters.TEXT & ~filters.COMMAND, got_age)],
             PHONE: [MessageHandler(filters.TEXT & ~filters.COMMAND, got_phone)],
             EMAIL: [MessageHandler(filters.TEXT & ~filters.COMMAND, got_email)],
+            FOUND_US: [MessageHandler(filters.TEXT & ~filters.COMMAND, got_found_us)],
+            GOAL: [MessageHandler(filters.TEXT & ~filters.COMMAND, got_goal)],
+            MOTIVATION: [MessageHandler(filters.TEXT & ~filters.COMMAND, got_motivation)],
             CATEGORY: [MessageHandler(filters.TEXT & ~filters.COMMAND, got_category)],
             PLAN: [MessageHandler(filters.TEXT & ~filters.COMMAND, got_plan)],
         },
@@ -411,6 +502,7 @@ def main():
     )
     app.add_handler(form)
     app.add_handler(CommandHandler("pay", pay_cmd))
+    app.add_handler(CommandHandler("curriculum", curriculum_cmd))
     app.add_handler(CommandHandler("status", status_cmd))
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("stats", stats))
