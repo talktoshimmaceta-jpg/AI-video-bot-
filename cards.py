@@ -9,7 +9,10 @@ import os
 from PIL import Image, ImageDraw, ImageFont
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-FONT_DIR = os.path.join(HERE, "fonts")
+# Fonts can live either in a fonts/ subfolder or directly in the repo root —
+# whichever is found first is used, so no need to reorganize files on GitHub.
+_fonts_subdir = os.path.join(HERE, "fonts")
+FONT_DIR = _fonts_subdir if os.path.isdir(_fonts_subdir) else HERE
 LOGO_PATH = os.getenv("LOGO_FILE", os.path.join(HERE, "logo.png"))
 
 NAVY = (5, 22, 46)
@@ -44,7 +47,7 @@ def _gold_border(draw, box, width=4, radius=28):
 # Student ID card
 # ---------------------------------------------------------------------------
 def generate_id_card(name: str, role: str, student_no: str, program: str) -> io.BytesIO:
-    W, H = 1000, 1500
+    W, H = 1000, 1250
     img = Image.new("RGB", (W, H), NAVY)
     draw = ImageDraw.Draw(img)
 
@@ -75,39 +78,37 @@ def generate_id_card(name: str, role: str, student_no: str, program: str) -> io.
     # big vertical "STUDENT" watermark on the left
     vert = Image.new("RGBA", (H, 220), (0, 0, 0, 0))
     vd = ImageDraw.Draw(vert)
-    vd.text((0, 0), "STUDENT", font=_font("Outfit-Bold.ttf", 150), fill=(255, 255, 255, 18))
+    vd.text((0, 0), "STUDENT", font=_font("Outfit-Bold.ttf", 150), fill=(255, 255, 255, 16))
     vert = vert.rotate(90, expand=True)
-    img.paste(vert, (0, 320), vert)
+    img.paste(vert, (0, 300), vert)
 
-    # ID photo placeholder circle with initials
-    cx, cy, r = W // 2, 560, 160
-    draw.ellipse([cx - r, cy - r, cx + r, cy + r], outline=GOLD, width=6, fill=(12, 42, 78))
-    initials = "".join([w[0].upper() for w in name.split()[:2]]) or "?"
-    ifont = _font("Outfit-Bold.ttf", 120)
-    bbox = draw.textbbox((0, 0), initials, font=ifont)
-    iw, ih = bbox[2] - bbox[0], bbox[3] - bbox[1]
-    draw.text((cx - iw / 2, cy - ih / 2 - bbox[1]), initials, font=ifont, fill=GOLD_LIGHT)
+    # small gold diamond emblem instead of a photo
+    ex, ey, es = W // 2, 350, 16
+    draw.polygon(
+        [(ex, ey - es), (ex + es, ey), (ex, ey + es), (ex - es, ey)],
+        outline=GOLD, width=3,
+    )
 
-    # name
-    name_font = _font("Italiana-Regular.ttf", 64)
-    _centered_text(draw, W // 2, 770, name, name_font, WHITE, anchor="ma")
+    # name — the centerpiece
+    name_font = _font("Italiana-Regular.ttf", 72)
+    _centered_text(draw, W // 2, 430, name, name_font, WHITE, anchor="ma")
 
     # divider
-    draw.line([(150, 870), (W - 150, 870)], fill=GOLD, width=2)
+    draw.line([(150, 560), (W - 150, 560)], fill=GOLD, width=2)
 
     # fields
     label_font = _font("WorkSans-Bold.ttf", 26)
-    value_font = _font("WorkSans-Regular.ttf", 30)
+    value_font = _font("WorkSans-Regular.ttf", 32)
     fields = [
         ("STUDENT ID", student_no),
         ("ROLE", role),
         ("PROGRAM", program),
     ]
-    fy = 920
+    fy = 620
     for label, value in fields:
         draw.text((150, fy), label, font=label_font, fill=GOLD)
-        draw.text((150, fy + 42), value, font=value_font, fill=CREAM)
-        fy += 110
+        draw.text((150, fy + 44), value, font=value_font, fill=CREAM)
+        fy += 130
 
     # bottom band
     draw.rounded_rectangle([40, H - 150, W - 40, H - 40], radius=24, fill=(8, 32, 62))
