@@ -41,9 +41,10 @@ CLASS_LINK_2 = os.getenv("CLASS_LINK_2", "")
 DB_PATH = os.getenv("DB_PATH", "students.db")
 CURRICULUM_FILE = os.getenv("CURRICULUM_FILE", "curriculum.pdf")
 LOGO_FILE = os.getenv("LOGO_FILE", "logo.png")
+WHATSAPP_LINK = os.getenv("WHATSAPP_LINK", "")
 TZ = ZoneInfo("Africa/Lagos")
 
-NAME, AGE, PHONE, EMAIL, FOUND_US, GOAL, MOTIVATION, CATEGORY, PLAN = range(9)
+NAME, AGE, PHONE, EMAIL, FOUND_US, GOAL, MOTIVATION, CATEGORY = range(8)
 CATEGORIES = ["Student", "Business owner", "Knowledge seeker", "Income seeker"]
 
 
@@ -205,31 +206,17 @@ async def got_category(update, ctx):
         reply_markup=ReplyKeyboardRemove(),
     )
     await send_curriculum(update.message, ctx)
-    kb = ReplyKeyboardMarkup(
-        [[f"Pay in full (N{PRICE_FULL:,})"], [f"Two instalments (N{PRICE_HALF:,} + N{PRICE_HALF:,})"]],
-        one_time_keyboard=True,
-        resize_keyboard=True,
-    )
+
+    if WHATSAPP_LINK:
+        await update.message.reply_text(
+            "Join our WhatsApp community here — this is where announcements, class links "
+            f"and updates will be shared:\n\n{WHATSAPP_LINK}"
+        )
+
     await update.message.reply_text(
-        "Now let's secure your seat — how would you like to pay?", reply_markup=kb
+        f"Good luck, {d['name']} — we're rooting for you already. See you soon! 🎉\n\n"
+        "When you're ready to secure your seat, just send /pay right here in this chat."
     )
-    return PLAN
-
-
-async def got_plan(update, ctx):
-    text = update.message.text.lower()
-    if "full" in text:
-        plan = "full"
-    elif "instal" in text:
-        plan = "two"
-    else:
-        await update.message.reply_text("Please pick one of the two options.")
-        return PLAN
-    uid = update.effective_user.id
-    with db() as c:
-        c.execute("UPDATE students SET plan=? WHERE user_id=?", (plan, uid))
-    await update.message.reply_text("Great choice.", reply_markup=ReplyKeyboardRemove())
-    await send_payment_instructions(update.message, ctx, uid)
     return ConversationHandler.END
 
 
@@ -281,10 +268,33 @@ async def send_payment_instructions(message, ctx, uid):
 
 
 async def pay_cmd(update, ctx):
-    if not get_student(update.effective_user.id):
+    s = get_student(update.effective_user.id)
+    if not s:
         await update.message.reply_text("Please register first with /start.")
         return
+    if not s["plan"]:
+        kb = InlineKeyboardMarkup(
+            [
+                [InlineKeyboardButton(f"Pay in full (N{PRICE_FULL:,})", callback_data="plan:full")],
+                [InlineKeyboardButton(
+                    f"Two instalments (N{PRICE_HALF:,} + N{PRICE_HALF:,})", callback_data="plan:two"
+                )],
+            ]
+        )
+        await update.message.reply_text("How would you like to pay?", reply_markup=kb)
+        return
     await send_payment_instructions(update.message, ctx, update.effective_user.id)
+
+
+async def choose_plan(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    plan = "full" if q.data == "plan:full" else "two"
+    uid = q.from_user.id
+    with db() as c:
+        c.execute("UPDATE students SET plan=? WHERE user_id=?", (plan, uid))
+    await q.edit_message_text("Great choice.")
+    await send_payment_instructions(q.message, ctx, uid)
 
 
 async def got_proof(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -496,7 +506,6 @@ def main():
             GOAL: [MessageHandler(filters.TEXT & ~filters.COMMAND, got_goal)],
             MOTIVATION: [MessageHandler(filters.TEXT & ~filters.COMMAND, got_motivation)],
             CATEGORY: [MessageHandler(filters.TEXT & ~filters.COMMAND, got_category)],
-            PLAN: [MessageHandler(filters.TEXT & ~filters.COMMAND, got_plan)],
         },
         fallbacks=[CommandHandler("cancel", cancel)],
     )
@@ -509,6 +518,7 @@ def main():
     app.add_handler(CommandHandler("export", export))
     app.add_handler(CommandHandler("broadcast", broadcast))
     app.add_handler(CallbackQueryHandler(review_payment, pattern=r"^(ap|rj):\d+$"))
+    app.add_handler(CallbackQueryHandler(choose_plan, pattern=r"^plan:(full|two)$"))
     app.add_handler(MessageHandler((filters.PHOTO | filters.Document.ALL) & filters.ChatType.PRIVATE, got_proof))
     app.job_queue.run_daily(daily_reminders, time=time(9, 0, tzinfo=TZ))
     app.run_polling()
