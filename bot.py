@@ -40,6 +40,8 @@ BANK_DETAILS = os.getenv("BANK_DETAILS", "Bank: ____\nAccount name: ____\nAccoun
 PAY_LINK = os.getenv("PAY_LINK", "")
 CLASS_LINK = os.getenv("CLASS_LINK", "")
 CLASS_LINK_2 = os.getenv("CLASS_LINK_2", "")
+CLASS_GROUP_ID = int(os.getenv("CLASS_GROUP_ID", "0") or 0)
+RULES_VERSION = os.getenv("RULES_VERSION", "2026-09-v1")
 DB_PATH = os.getenv("DB_PATH", "students.db")
 CURRICULUM_FILE = os.getenv("CURRICULUM_FILE", "curriculum.pdf")
 LOGO_FILE = os.getenv("LOGO_FILE", "logo.png")
@@ -89,6 +91,30 @@ def init_db():
             c.execute("ALTER TABLE students ADD COLUMN referred_by TEXT")
         if "bonus_sent" not in cols:
             c.execute("ALTER TABLE students ADD COLUMN bonus_sent INTEGER DEFAULT 0")
+        if "rules_accepted_at" not in cols:
+            c.execute("ALTER TABLE students ADD COLUMN rules_accepted_at TEXT")
+        if "rules_version" not in cols:
+            c.execute("ALTER TABLE students ADD COLUMN rules_version TEXT")
+        c.executescript("""
+            CREATE TABLE IF NOT EXISTS moderation_reports (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id INTEGER, message_id INTEGER, user_id INTEGER,
+                username TEXT, display_name TEXT, message_text TEXT,
+                detected_terms TEXT, status TEXT DEFAULT 'pending',
+                created_at TEXT, reviewed_by INTEGER, reviewed_at TEXT, decision TEXT
+            );
+            CREATE TABLE IF NOT EXISTS assignment_submissions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL, assignment_key TEXT NOT NULL,
+                file_id TEXT, text TEXT, submitted_at TEXT NOT NULL,
+                UNIQUE(user_id, assignment_key)
+            );
+            CREATE TABLE IF NOT EXISTS support_tickets (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER, message TEXT, status TEXT DEFAULT 'open',
+                created_at TEXT, handled_by INTEGER
+            );
+        """)
 
 
 def get_student(uid):
@@ -129,9 +155,10 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             ctx.user_data["source"] = payload
     s = get_student(uid)
     if s:
-        await update.message.reply_text(
-            f"Welcome back, {s['name']}! Use /pay to make a payment, /status to check your status, or /help.",
-        )
+        if not rules_accepted(uid):
+            await send_rules_page(ctx, uid, 0)
+        else:
+            await send_student_menu(ctx, uid, f"Welcome back, {s['name']}!")
         return ConversationHandler.END
 
     if os.path.exists(LOGO_FILE):
@@ -261,12 +288,8 @@ async def got_category(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     await send_curriculum_to(ctx, u.id)
 
-    if WHATSAPP_LINK:
-        await ctx.bot.send_message(
-            u.id,
-            "Join our WhatsApp community here — this is where announcements, class links "
-            f"and updates will be shared:\n\n{WHATSAPP_LINK}",
-        )
+    # Class access is gated by mandatory rules acceptance. Do not send class links here.
+    await send_rules_page(ctx, u.id, 0)
 
     await ctx.bot.send_message(
         u.id, f"Good luck, {d['name']} — we're rooting for you already. See you soon! 🎉"
@@ -299,13 +322,11 @@ async def maybe_send_referral_bonus(ctx, referrer_no):
                 "UPDATE students SET bonus_sent=1, status='paid', paid_amount=?, second_due=NULL WHERE student_no=?",
                 (PRICE_FULL, referrer_no),
             )
-        link = CLASS_LINK_2 or CLASS_LINK
         msg = (
             f"🎉 Amazing — you've referred {count} people! That earns you FREE full access "
-            f"to the {PROGRAM}, no payment needed. You're all set."
+            f"to the {PROGRAM}, no payment needed. Please open the rules and accept them "
+            "to receive class access."
         )
-        if link:
-            msg += f"\n\nHere's your class link:\n{link}"
         try:
             await ctx.bot.send_message(referrer["user_id"], msg)
         except Exception as e:
@@ -472,14 +493,11 @@ async def review_payment(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await q.answer("Approved")
     await q.edit_message_caption((q.message.caption or "") + "\n\nAPPROVED")
     if status == "paid":
-        msg = "Payment confirmed. You're fully paid!"
-        link = CLASS_LINK_2 or CLASS_LINK
+        msg = "Payment confirmed. You're fully paid! Please review and accept the Academy Rules & Regulations to receive your class access."
     else:
-        msg = f"Payment confirmed. Your balance of N{PRICE_FULL - paid:,} is due within 7 days to unlock the second half."
-        link = CLASS_LINK
-    if link:
-        msg += f"\n\nJoin the class here: {link}"
+        msg = f"Payment confirmed. Your balance of N{PRICE_FULL - paid:,} is due within 7 days to unlock the second half. Please review and accept the Academy Rules & Regulations."
     await ctx.bot.send_message(p["user_id"], msg)
+    await send_rules_page(ctx, p["user_id"], 0)
 
 
 async def status_cmd(update, ctx):
@@ -578,20 +596,269 @@ async def leaderboard_cmd(update, ctx):
 
 
 async def help_cmd(update, ctx):
-    text = (
-        "/start - register\n/pay - payment details\n/status - your payment status"
-        "\n/curriculum - get the training curriculum (PDF)"
-        "\n/id - get your student ID card"
-        "\n/certificate - get your completion certificate (once eligible)"
-        "\n/refer - get your referral link and see your referral count"
-        "\n/leaderboard - see the top referrers"
-    )
-    if update.effective_user.id in ADMIN_IDS:
-        text += (
-            "\n\nAdmin:\n/stats\n/export\n/broadcast <all|unpaid|paid> <message>"
-            "\n/complete <telegram_id> - mark a student as completed and send their certificate"
-        )
-    await update.message.reply_text(text)
+    await send_student_menu(ctx, update.effective_user.id, "How can we help you?")
+
+
+# ---------- student menu, rules gate, FAQs, assignments and moderation ----------
+RULES_PAGES = [
+    ("1/5 — Respectful conduct", "Communicate respectfully with instructors and fellow students. Insults, harassment, threats, bullying, hate speech, sexual harassment, and deliberate foul or abusive language are prohibited."),
+    ("2/5 — Removal and other violations", "Confirmed abusive or seriously disruptive conduct may result in immediate removal without prior warning. Spam, impersonation, unauthorized sharing of class links or course materials, and deliberate disruption may also result in removal."),
+    ("3/5 — Assignments and deadlines", "Submit assignments before the stated deadline. Missing or late assignments alone do not remove you from class, but may affect certification eligibility."),
+    ("4/5 — Certification", "Certification requires submission of the final project and at least four assignments, within the Academy's stated submission cutoffs."),
+    ("5/5 — Access and declaration", "Class access is for enrolled students only. By accepting, you confirm that you have reviewed these rules and agree to follow them. Violations may result in loss of class access, subject to applicable payment/refund terms."),
+]
+
+FAQS = {
+    "schedule": ("Classes & Schedule", [
+        ("When are classes?", "Monday, Tuesday, Thursday and Friday, 8–10 PM. Friday is the live milestone session. Confirmed times are Nigeria time (Africa/Lagos)."),
+        ("Where is the class?", "The class is hosted in the private Telegram class group. The bot releases access after you accept the rules and your enrollment is eligible."),
+        ("What if I miss a class?", "Follow the Academy's replay instructions and complete the required work before its deadline."),
+    ]),
+    "assignments": ("Assignments", [
+        ("When are assignments due?", "Monday task: Tuesday 6 PM. Tuesday task: Thursday 6 PM. Thursday task: Friday 5 PM. Friday weekly milestone: Sunday 11:59 PM."),
+        ("Can I submit late?", "No. Work must be submitted before the stated deadline. Late submissions may not be reviewed or counted."),
+        ("Will missing work get me removed?", "No. Missing assignments alone do not remove you from class, but certification requirements still apply."),
+        ("How do I submit?", "Use the Assignments menu and follow the instructions for the active task. If submission buttons are not available for your task, contact an admin through Ask Admin."),
+    ]),
+    "cert": ("Certification", [
+        ("What do I need?", "Submit the final project and at least four assignments before the applicable cutoffs."),
+        ("When are certificates issued?", "After the final project cutoff and eligibility verification by the Academy."),
+    ]),
+    "payment": ("Payments & Referrals", [
+        ("How do I check payment status?", "Choose Payment & Status from the menu or use /status."),
+        ("How do referrals work?", "Open Refer a Friend to get your personal link and referral count. Referral free access is subject to the published threshold and available slots."),
+    ]),
+    "rules": ("Rules & Conduct", [
+        ("What happens for abusive language?", "Potential abuse is sent privately to an Academy admin for review. Removal occurs only after an authorized admin confirms the violation."),
+        ("How do I accept the rules?", "Open Rules & Regulations and navigate through all sections. The acceptance button appears at the final section."),
+    ]),
+}
+
+
+def rules_accepted(uid):
+    s = get_student(uid)
+    return bool(s and s["rules_accepted_at"] and s["rules_version"] == RULES_VERSION)
+
+
+def student_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📚 My Classes", callback_data="menu:classes"), InlineKeyboardButton("📝 Assignments", callback_data="menu:assignments")],
+        [InlineKeyboardButton("❓ Help & FAQs", callback_data="menu:help"), InlineKeyboardButton("💬 Ask Admin", callback_data="menu:ask")],
+        [InlineKeyboardButton("📈 My Progress", callback_data="menu:progress"), InlineKeyboardButton("📜 Rules & Regulations", callback_data="menu:rules")],
+        [InlineKeyboardButton("👥 Refer a Friend", callback_data="menu:refer"), InlineKeyboardButton("🎓 Certification", callback_data="menu:cert")],
+        [InlineKeyboardButton("💳 Payment & Status", callback_data="menu:status")],
+    ])
+
+
+async def send_student_menu(ctx, uid, intro="Heribhee Academy Student Menu"):
+    await ctx.bot.send_message(uid, intro + "\n\nChoose an option:", reply_markup=student_keyboard())
+
+
+async def send_rules_page(ctx, uid, page):
+    page = max(0, min(page, len(RULES_PAGES)-1))
+    title, body = RULES_PAGES[page]
+    rows = []
+    if page > 0:
+        rows.append(InlineKeyboardButton("⬅ Previous", callback_data=f"rules:page:{page-1}"))
+    if page < len(RULES_PAGES)-1:
+        rows.append(InlineKeyboardButton("Next ➡", callback_data=f"rules:page:{page+1}"))
+    keyboard = [rows] if rows else []
+    if page == len(RULES_PAGES)-1:
+        keyboard.append([InlineKeyboardButton("I HAVE READ AND ACCEPT", callback_data="rules:accept")])
+    else:
+        keyboard.append([InlineKeyboardButton("Back to start", callback_data="rules:page:0")])
+    await ctx.bot.send_message(uid, f"HERIBHEE ACADEMY — RULES & REGULATIONS\n\n{title}\n\n{body}\n\nPlease use the buttons to review every section.", reply_markup=InlineKeyboardMarkup(keyboard))
+
+
+async def menu_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    uid = q.from_user.id
+    await q.answer()
+    data = q.data
+    if data.startswith("rules:page:"):
+        await send_rules_page(ctx, uid, int(data.rsplit(":", 1)[1])); return
+    if data == "rules:accept":
+        if not get_student(uid):
+            await q.message.reply_text("Please register first using /start."); return
+        with db() as c:
+            c.execute("UPDATE students SET rules_accepted_at=?, rules_version=? WHERE user_id=?", (now().isoformat(), RULES_VERSION, uid))
+        await q.message.reply_text("Thank you. Your acceptance has been recorded.")
+        await deliver_class_access(ctx, uid)
+        await send_student_menu(ctx, uid)
+        return
+    if data.startswith("faq:"):
+        key = data.split(":",1)[1]
+        title, items = FAQS.get(key, ("Help", []))
+        kb = [[InlineKeyboardButton(question, callback_data=f"faqanswer:{key}:{i}")] for i,(question,_) in enumerate(items)]
+        kb.append([InlineKeyboardButton("⬅ Help categories", callback_data="menu:help")])
+        await q.message.reply_text(title + "\nChoose a question:", reply_markup=InlineKeyboardMarkup(kb)); return
+    if data.startswith("faqanswer:"):
+        _, key, n = data.split(":")
+        title, items = FAQS[key]
+        question, answer = items[int(n)]
+        await q.message.reply_text(f"{question}\n\n{answer}", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅ Back to questions", callback_data=f"faq:{key}")],[InlineKeyboardButton("Main menu", callback_data="menu:home")]])); return
+    if data == "menu:home":
+        await send_student_menu(ctx, uid); return
+    if data == "menu:help":
+        kb = [[InlineKeyboardButton(v[0], callback_data=f"faq:{k}")] for k,v in FAQS.items()]
+        kb.append([InlineKeyboardButton("Main menu", callback_data="menu:home")])
+        await q.message.reply_text("Help & FAQs — choose a category:", reply_markup=InlineKeyboardMarkup(kb)); return
+    if data == "menu:rules":
+        await send_rules_page(ctx, uid, 0); return
+    if data == "menu:classes":
+        if not rules_accepted(uid):
+            await send_rules_page(ctx, uid, 0); return
+        await deliver_class_access(ctx, uid); return
+    if data == "menu:assignments":
+        await q.message.reply_text("Assignment deadlines (Nigeria time):\n• Monday task — Tuesday, 6 PM\n• Tuesday task — Thursday, 6 PM\n• Thursday task — Friday, 5 PM\n• Friday milestone — Sunday, 11:59 PM\n\nSubmit before the stated deadline. Use Ask Admin if you need help with a submission.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Submit assignment", callback_data="assignment:submitinfo")],[InlineKeyboardButton("Main menu", callback_data="menu:home")]])); return
+    if data == "assignment:submitinfo":
+        ctx.user_data["awaiting_assignment"] = True
+        await q.message.reply_text("Send your assignment as a document, photo, or text in this private chat. Include the assignment name in your message/caption. Your submission will be recorded for admin review.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Cancel", callback_data="menu:home")]])); return
+    if data == "menu:progress":
+        with db() as c:
+            rows = c.execute("SELECT assignment_key, submitted_at FROM assignment_submissions WHERE user_id=? ORDER BY submitted_at", (uid,)).fetchall()
+        text = "Your recorded submissions:\n" + ("\n".join(f"• {r['assignment_key']} — {r['submitted_at'][:16].replace('T',' ')}" for r in rows) if rows else "No assignments recorded yet.")
+        await q.message.reply_text(text, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Main menu", callback_data="menu:home")]])); return
+    if data == "menu:ask":
+        ctx.user_data["awaiting_support"] = True
+        await q.message.reply_text("Please type your question or describe the issue here. It will be sent privately to the Academy admins.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Cancel", callback_data="menu:home")]])); return
+    if data == "menu:refer":
+        s=get_student(uid)
+        if not s: await q.message.reply_text("Please register first with /start."); return
+        count=referral_count(s["student_no"]); remaining=max(0,REFERRAL_BONUS_THRESHOLD-count)
+        if not BOT_USERNAME: await q.message.reply_text("Referral link is not configured yet."); return
+        link=f"https://t.me/{BOT_USERNAME}?start=ref_{s['student_no']}"
+        await q.message.reply_text(f"Your referral link:\n{link}\n\nReferrals: {count}. Remaining to threshold: {remaining}."); return
+    if data == "menu:cert":
+        s=get_student(uid)
+        if not s: await q.message.reply_text("Please register first with /start."); return
+        await q.message.reply_text("Certification requires the final project and at least four assignments. Use My Progress to check recorded submissions."); return
+    if data == "menu:status":
+        s=get_student(uid)
+        if not s: await q.message.reply_text("Please register first with /start."); return
+        await q.message.reply_text(f"Status: {s['status']}\nPaid: N{s['paid_amount']:,} of N{PRICE_FULL:,}\nRules accepted: {'Yes' if rules_accepted(uid) else 'No'}"); return
+
+
+async def deliver_class_access(ctx, uid):
+    s = get_student(uid)
+    if not s:
+        await ctx.bot.send_message(uid, "Please register first using /start."); return
+    if not rules_accepted(uid):
+        await send_rules_page(ctx, uid, 0); return
+    if s["status"] != "paid" and not s["bonus_sent"]:
+        await ctx.bot.send_message(uid, "Your class access is not yet unlocked. Please complete payment or check your status using /status."); return
+    link = CLASS_LINK_2 or CLASS_LINK
+    if link:
+        await ctx.bot.send_message(uid, f"Your class access link (please do not share it):\n{link}")
+    else:
+        await ctx.bot.send_message(uid, "Your rules acceptance is recorded. The class invite link has not been configured yet; please contact an admin.")
+
+
+async def student_private_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    msg = update.effective_message
+    uid = update.effective_user.id
+    if uid in ADMIN_IDS or not get_student(uid):
+        return
+    if ctx.user_data.get("awaiting_support"):
+        text = (msg.text or msg.caption or "[attachment]")[:3500]
+        with db() as c:
+            cur = c.execute("INSERT INTO support_tickets(user_id,message,created_at) VALUES(?,?,?)", (uid,text,now().isoformat()))
+            tid = cur.lastrowid
+        s = get_student(uid)
+        for admin in ADMIN_IDS:
+            await ctx.bot.send_message(admin, f"Support ticket #{tid}\nStudent: {s['name']} ({s['student_no']})\nTelegram: {uid}\n\n{text}", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Mark handled", callback_data=f"supportdone:{tid}")]]))
+        ctx.user_data.pop("awaiting_support",None)
+        await msg.reply_text("Your question has been sent to the Academy admins. We'll get back to you.")
+        return
+    if ctx.user_data.get("awaiting_assignment"):
+        s = get_student(uid)
+        caption = (msg.caption or msg.text or "").strip()
+        key = caption[:100] if caption else "Unlabelled assignment"
+        file_id = msg.document.file_id if msg.document else (msg.photo[-1].file_id if msg.photo else None)
+        with db() as c:
+            c.execute("INSERT OR REPLACE INTO assignment_submissions(user_id,assignment_key,file_id,text,submitted_at) VALUES(?,?,?,?,?)", (uid,key,file_id,caption,now().isoformat()))
+        ctx.user_data.pop("awaiting_assignment",None)
+        await msg.reply_text(f"Your submission for '{key}' has been recorded for review.")
+        for admin in ADMIN_IDS:
+            await ctx.bot.send_message(admin, f"Assignment submission\n{s['name']} ({s['student_no']})\nTask: {key}\nSubmitted: {now().isoformat()}\nTelegram ID: {uid}")
+            if file_id:
+                if msg.document:
+                    await ctx.bot.send_document(admin,file_id,caption=f"{s['student_no']} — {key}")
+                elif msg.photo:
+                    await ctx.bot.send_photo(admin,file_id,caption=f"{s['student_no']} — {key}")
+            elif caption:
+                await ctx.bot.send_message(admin, caption)
+        return
+
+
+async def group_moderation(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    msg = update.effective_message
+    user = update.effective_user
+    if not msg or not user or user.is_bot or user.id in ADMIN_IDS:
+        return
+    # Moderation is restricted to the configured class group, not private chats.
+    if CLASS_GROUP_ID and msg.chat_id != CLASS_GROUP_ID:
+        return
+    if msg.chat.type not in ("group", "supergroup"):
+        return
+    text = (msg.text or msg.caption or "").lower()
+    if not text:
+        return
+    # Initial configurable keyword detector; admins make the actual removal decision.
+    terms = ["fuck", "fucking", "shit", "bitch", "bastard", "motherfucker", "asshole", "idiot", "stupid", "retard"]
+    hits = [term for term in terms if term in text]
+    if not hits:
+        return
+    try:
+        await msg.delete()
+    except Exception as e:
+        log.warning("Could not delete flagged message: %s", e)
+    display = user.full_name or str(user.id)
+    with db() as c:
+        cur = c.execute("INSERT INTO moderation_reports(chat_id,message_id,user_id,username,display_name,message_text,detected_terms,created_at) VALUES(?,?,?,?,?,?,?,?)", (msg.chat_id,msg.message_id,user.id,user.username,display,text[:3000],", ".join(hits),now().isoformat()))
+        rid = cur.lastrowid
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton("Confirm removal", callback_data=f"mod:remove:{rid}"),InlineKeyboardButton("Dismiss", callback_data=f"mod:dismiss:{rid}")]])
+    for admin in ADMIN_IDS:
+        try:
+            await ctx.bot.send_message(admin, f"⚠️ MODERATION REVIEW #{rid}\nStudent: {display} (@{user.username or 'no username'})\nUser ID: {user.id}\nGroup: {msg.chat.title or msg.chat_id}\nDetected: {', '.join(hits)}\n\nFlagged message:\n{text[:2500]}\n\nMessage was deleted pending review. Confirm removal or dismiss.", reply_markup=kb)
+        except Exception as e:
+            log.warning("Could not send moderation alert to admin %s: %s", admin,e)
+
+
+async def moderation_decision(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q=update.callback_query
+    if q.from_user.id not in ADMIN_IDS:
+        await q.answer("Admins only",show_alert=True); return
+    _, action, rid_s=q.data.split(":")
+    rid=int(rid_s)
+    with db() as c:
+        report=c.execute("SELECT * FROM moderation_reports WHERE id=?",(rid,)).fetchone()
+        if not report or report["status"] != "pending":
+            await q.answer("This report has already been handled.",show_alert=True); return
+        decision="removed" if action=="remove" else "dismissed"
+        c.execute("UPDATE moderation_reports SET status=?,reviewed_by=?,reviewed_at=?,decision=? WHERE id=?",(decision,q.from_user.id,now().isoformat(),decision,rid))
+    if action=="remove":
+        try:
+            await ctx.bot.ban_chat_member(report["chat_id"],report["user_id"])
+            await q.answer("Student removed")
+            await q.edit_message_text((q.message.text or "")+f"\n\nADMIN DECISION: REMOVED by {q.from_user.full_name}")
+        except Exception as e:
+            await q.answer("Could not remove member; check bot admin permissions.",show_alert=True)
+            log.exception("Moderation ban failed: %s",e)
+    else:
+        await q.answer("Report dismissed")
+        await q.edit_message_text((q.message.text or "")+f"\n\nADMIN DECISION: DISMISSED by {q.from_user.full_name}")
+
+
+async def support_decision(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q=update.callback_query
+    if q.from_user.id not in ADMIN_IDS:
+        await q.answer("Admins only",show_alert=True); return
+    tid=int(q.data.split(":")[1])
+    with db() as c:
+        c.execute("UPDATE support_tickets SET status='handled',handled_by=? WHERE id=?",(q.from_user.id,tid))
+    await q.answer("Marked handled")
+    await q.edit_message_text((q.message.text or "")+f"\n\nHandled by {q.from_user.full_name}")
 
 
 # ---------- admin ----------
@@ -752,6 +1019,11 @@ def main():
     app.add_handler(CommandHandler("certificate", certificate_cmd))
     app.add_handler(CommandHandler("status", status_cmd))
     app.add_handler(CommandHandler("help", help_cmd))
+    app.add_handler(CallbackQueryHandler(menu_callback, pattern=r"^(menu:|rules:|faq:|faqanswer:|assignment:).+"))
+    app.add_handler(CallbackQueryHandler(moderation_decision, pattern=r"^mod:(remove|dismiss):\d+$"))
+    app.add_handler(CallbackQueryHandler(support_decision, pattern=r"^supportdone:\d+$"))
+    app.add_handler(MessageHandler(filters.ChatType.PRIVATE & (filters.TEXT | filters.PHOTO | filters.Document.ALL) & ~filters.COMMAND, student_private_message), group=2)
+    app.add_handler(MessageHandler(filters.ChatType.GROUPS & (filters.TEXT | filters.CAPTION), group_moderation), group=1)
     app.add_handler(CommandHandler("refer", refer_cmd))
     app.add_handler(CommandHandler("leaderboard", leaderboard_cmd))
     app.add_handler(CommandHandler("stats", stats))
