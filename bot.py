@@ -32,7 +32,9 @@ logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("bot")
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
-ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip()}
+ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_IDS", "8596935426,7101038703").split(",") if x.strip()}
+REVIEWER_IDS = {int(x) for x in os.getenv("ASSIGNMENT_REVIEWER_IDS", "").split(",") if x.strip()} | ADMIN_IDS
+ADMIN_GROUP_ID = int(os.getenv("ADMIN_GROUP_ID", "0") or 0)
 PROGRAM = os.getenv("PROGRAM_NAME", "AI Video & Movie Making Training")
 PRICE_FULL = int(os.getenv("PRICE_FULL", "5000"))
 PRICE_HALF = int(os.getenv("PRICE_HALF", "2500"))
@@ -97,6 +99,14 @@ def init_db():
             c.execute("ALTER TABLE students ADD COLUMN rules_version TEXT")
         if "registration_pack_sent_at" not in cols:
             c.execute("ALTER TABLE students ADD COLUMN registration_pack_sent_at TEXT")
+        # Add review fields to older databases safely.
+        subcols = {r["name"] for r in c.execute("PRAGMA table_info(assignment_submissions)").fetchall()}
+        for col, declaration in {
+            "review_status": "TEXT DEFAULT 'pending'", "reviewed_by": "INTEGER",
+            "reviewed_at": "TEXT", "review_note": "TEXT"
+        }.items():
+            if col not in subcols:
+                c.execute(f"ALTER TABLE assignment_submissions ADD COLUMN {col} {declaration}")
         c.executescript("""
             CREATE TABLE IF NOT EXISTS moderation_reports (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -109,6 +119,8 @@ def init_db():
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 user_id INTEGER NOT NULL, assignment_key TEXT NOT NULL,
                 file_id TEXT, text TEXT, submitted_at TEXT NOT NULL,
+                review_status TEXT DEFAULT 'pending', reviewed_by INTEGER,
+                reviewed_at TEXT, review_note TEXT,
                 UNIQUE(user_id, assignment_key)
             );
             CREATE TABLE IF NOT EXISTS support_tickets (
@@ -146,6 +158,9 @@ def referral_count(student_no):
 # ---------- registration form ----------
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
+    if uid in ADMIN_IDS:
+        await send_admin_dashboard(ctx, uid)
+        return ConversationHandler.END
     if ctx.args:
         payload = ctx.args[0][:60]
         if payload.startswith("ref_"):
@@ -556,7 +571,22 @@ async def certificate_cmd(update, ctx):
         await update.message.reply_text("Sorry, something went wrong generating your certificate. Try again shortly.")
 
 
+async def review_cmd(update, ctx):
+    if update.effective_user.id not in REVIEWER_IDS:
+        await update.message.reply_text("This command is for assigned reviewers only.")
+        return
+    await update.message.reply_text("ASSIGNMENT REVIEWER DASHBOARD\nChoose pending assignments:", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Pending reviews", callback_data="admin:pending:0")]]))
+
+
+async def chatid_cmd(update, ctx):
+    if update.effective_user.id in ADMIN_IDS:
+        await update.effective_message.reply_text(f"This chat ID is: {update.effective_chat.id}")
+
+
 async def id_cmd(update, ctx):
+    if update.effective_user.id in ADMIN_IDS:
+        await update.message.reply_text(f"Your Telegram user ID: {update.effective_user.id}")
+        return
     s = get_student(update.effective_user.id)
     if not s:
         await update.message.reply_text("You're not registered yet. Send /start.")
@@ -822,15 +852,18 @@ async def student_private_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE
             c.execute("INSERT OR REPLACE INTO assignment_submissions(user_id,assignment_key,file_id,text,submitted_at) VALUES(?,?,?,?,?)", (uid,key,file_id,caption,now().isoformat()))
         ctx.user_data.pop("awaiting_assignment",None)
         await msg.reply_text(f"Your submission for '{key}' has been recorded for review.")
-        for admin in ADMIN_IDS:
-            await ctx.bot.send_message(admin, f"Assignment submission\n{s['name']} ({s['student_no']})\nTask: {key}\nSubmitted: {now().isoformat()}\nTelegram ID: {uid}")
+        recipients = [ADMIN_GROUP_ID] if ADMIN_GROUP_ID else list(ADMIN_IDS)
+        header = (f"Assignment submission\nStudent: {s['name']} ({s['student_no']})\n"
+                  f"Task: {key}\nSubmitted: {now().isoformat()}\nTelegram ID: {uid}")
+        for recipient in recipients:
+            await ctx.bot.send_message(recipient, header)
             if file_id:
                 if msg.document:
-                    await ctx.bot.send_document(admin,file_id,caption=f"{s['student_no']} — {key}")
+                    await ctx.bot.send_document(recipient, file_id, caption=f"{s['student_no']} — {key}")
                 elif msg.photo:
-                    await ctx.bot.send_photo(admin,file_id,caption=f"{s['student_no']} — {key}")
+                    await ctx.bot.send_photo(recipient, file_id, caption=f"{s['student_no']} — {key}")
             elif caption:
-                await ctx.bot.send_message(admin, caption)
+                await ctx.bot.send_message(recipient, caption)
         return
 
 
@@ -902,6 +935,114 @@ async def support_decision(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         c.execute("UPDATE support_tickets SET status='handled',handled_by=? WHERE id=?",(q.from_user.id,tid))
     await q.answer("Marked handled")
     await q.edit_message_text((q.message.text or "")+f"\n\nHandled by {q.from_user.full_name}")
+
+
+# ---------- admin dashboard and assignment review ----------
+def admin_dashboard_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("Student list", callback_data="admin:students:0"), InlineKeyboardButton("Assignment overview", callback_data="admin:assignments")],
+        [InlineKeyboardButton("Pending reviews", callback_data="admin:pending:0"), InlineKeyboardButton("Certification overview", callback_data="admin:certs")],
+        [InlineKeyboardButton("Stats", callback_data="admin:stats"), InlineKeyboardButton("Export students", callback_data="admin:export")],
+        [InlineKeyboardButton("Show my Telegram ID", callback_data="admin:myid")],
+    ])
+
+
+async def send_admin_dashboard(ctx, uid):
+    await ctx.bot.send_message(uid, "HERIBHEE ACADEMY — ADMIN DASHBOARD\n\nChoose an admin function:", reply_markup=admin_dashboard_keyboard())
+
+
+async def admin_dashboard_callback(update, ctx):
+    q=update.callback_query
+    uid=q.from_user.id
+    data=q.data
+    if uid not in ADMIN_IDS and not (uid in REVIEWER_IDS and data.startswith("admin:pending:")):
+        await q.answer("This admin function is not available to your account.", show_alert=True); return
+    await q.answer()
+    if data == "admin:home":
+        await send_admin_dashboard(ctx,uid); return
+    if data == "admin:myid":
+        await q.message.reply_text(f"Your Telegram user ID: {uid}"); return
+    if data == "admin:stats":
+        with db() as c:
+            total=c.execute("SELECT COUNT(*) n FROM students").fetchone()["n"]
+            paid=c.execute("SELECT COUNT(*) n FROM students WHERE status='paid'").fetchone()["n"]
+            revenue=c.execute("SELECT COALESCE(SUM(paid_amount),0) r FROM students").fetchone()["r"]
+            subs=c.execute("SELECT COUNT(*) n FROM assignment_submissions").fetchone()["n"]
+            pending=c.execute("SELECT COUNT(*) n FROM assignment_submissions WHERE review_status='pending'").fetchone()["n"]
+        await q.message.reply_text(f"ACADEMY SNAPSHOT\nStudents: {total}\nFully paid: {paid}\nConfirmed revenue: ₦{revenue:,}\nAssignment submissions: {subs}\nPending reviews: {pending}",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Admin dashboard",callback_data="admin:home")]])); return
+    if data == "admin:export":
+        with db() as c: rows=c.execute("SELECT * FROM students").fetchall()
+        buf=io.StringIO(); w=csv.writer(buf)
+        if rows:
+            w.writerow(rows[0].keys())
+            for r in rows: w.writerow(list(r))
+        out=io.BytesIO(buf.getvalue().encode()); out.name="students.csv"
+        await q.message.reply_document(out,caption="Student database export"); return
+    if data == "admin:assignments":
+        with db() as c:
+            rows=c.execute("SELECT review_status,COUNT(*) n FROM assignment_submissions GROUP BY review_status").fetchall()
+            total=c.execute("SELECT COUNT(*) n FROM assignment_submissions").fetchone()["n"]
+        counts={r["review_status"]:r["n"] for r in rows}
+        await q.message.reply_text(f"Assignment submissions: {total}\nPending: {counts.get('pending',0)}\nApproved: {counts.get('approved',0)}\nNeeds correction: {counts.get('correction',0)}",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Pending reviews",callback_data="admin:pending:0")],[InlineKeyboardButton("Admin dashboard",callback_data="admin:home")]])); return
+    if data == "admin:certs":
+        with db() as c:
+            rows=c.execute("SELECT s.name,s.student_no,COUNT(a.id) total,SUM(CASE WHEN a.review_status='approved' THEN 1 ELSE 0 END) approved FROM students s LEFT JOIN assignment_submissions a ON a.user_id=s.user_id GROUP BY s.user_id ORDER BY s.name").fetchall()
+        lines=["CERTIFICATION PROGRESS (reviewed assignment counts)"]
+        lines += [f"{r['name']} ({r['student_no']}): {r['approved'] or 0} approved / {r['total'] or 0} submitted" for r in rows[:60]]
+        await q.message.reply_text("\n".join(lines) if len(lines)>1 else "No student records yet.",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Admin dashboard",callback_data="admin:home")]])); return
+    if data.startswith("admin:students:"):
+        offset=int(data.rsplit(":",1)[1])
+        with db() as c: rows=c.execute("SELECT name,student_no,status,user_id FROM students ORDER BY name LIMIT 15 OFFSET ?",(offset,)).fetchall()
+        lines=[f"{r['name']} — {r['student_no']} — {r['status']} — Telegram {r['user_id']}" for r in rows]
+        kb=[]
+        if offset: kb.append([InlineKeyboardButton("Previous",callback_data=f"admin:students:{max(0,offset-15)}")])
+        if len(rows)==15: kb.append([InlineKeyboardButton("Next",callback_data=f"admin:students:{offset+15}")])
+        kb.append([InlineKeyboardButton("Admin dashboard",callback_data="admin:home")])
+        await q.message.reply_text("STUDENTS\n\n"+("\n".join(lines) if lines else "No more students."),reply_markup=InlineKeyboardMarkup(kb)); return
+    if data.startswith("admin:pending:"):
+        offset=int(data.rsplit(":",1)[1])
+        with db() as c:
+            rows=c.execute("SELECT a.id,a.assignment_key,a.submitted_at,s.name,s.student_no FROM assignment_submissions a JOIN students s ON s.user_id=a.user_id WHERE a.review_status='pending' ORDER BY a.submitted_at LIMIT 10 OFFSET ?",(offset,)).fetchall()
+        if not rows:
+            await q.message.reply_text("No pending assignment reviews.",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Admin dashboard",callback_data="admin:home")]])); return
+        for r in rows:
+            await q.message.reply_text(f"Submission #{r['id']}\nStudent: {r['name']} ({r['student_no']})\nAssignment: {r['assignment_key']}\nSubmitted: {r['submitted_at']}",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Open review",callback_data=f"reviewopen:{r['id']}")]]))
+        return
+
+
+async def review_open_callback(update,ctx):
+    q=update.callback_query
+    if q.from_user.id not in REVIEWER_IDS:
+        await q.answer("Authorized assignment reviewers only.",show_alert=True); return
+    sid=int(q.data.split(":")[1])
+    with db() as c:
+        r=c.execute("SELECT a.*,s.name,s.student_no,s.user_id FROM assignment_submissions a JOIN students s ON s.user_id=a.user_id WHERE a.id=?",(sid,)).fetchone()
+    if not r:
+        await q.answer("Submission not found.",show_alert=True); return
+    await q.answer()
+    await q.message.reply_text(f"REVIEW SUBMISSION #{sid}\nStudent: {r['name']} ({r['student_no']})\nAssignment: {r['assignment_key']}\nSubmitted: {r['submitted_at']}\n\nSubmission text: {r['text'] or '(No text)'}",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Approve",callback_data=f"assignmentreview:approve:{sid}"),InlineKeyboardButton("Request correction",callback_data=f"assignmentreview:correction:{sid}")]]))
+    if r['file_id']:
+        try: await ctx.bot.send_document(q.from_user.id,r['file_id'],caption=f"Student {r['student_no']} — {r['assignment_key']}")
+        except Exception:
+            try: await ctx.bot.send_photo(q.from_user.id,r['file_id'],caption=f"Student {r['student_no']} — {r['assignment_key']}")
+            except Exception: pass
+
+
+async def assignment_review_decision(update,ctx):
+    q=update.callback_query
+    if q.from_user.id not in REVIEWER_IDS:
+        await q.answer("Authorized assignment reviewers only.",show_alert=True); return
+    _,decision,sid_s=q.data.split(":"); sid=int(sid_s)
+    with db() as c:
+        r=c.execute("SELECT a.*,s.name,s.student_no,s.user_id FROM assignment_submissions a JOIN students s ON s.user_id=a.user_id WHERE a.id=?",(sid,)).fetchone()
+        if not r: await q.answer("Submission not found.",show_alert=True); return
+        status="approved" if decision=="approve" else "correction"
+        c.execute("UPDATE assignment_submissions SET review_status=?,reviewed_by=?,reviewed_at=?,review_note=? WHERE id=?",(status,q.from_user.id,now().isoformat(),"Please review the feedback from your assignment admin and resubmit/contact the Academy." if status=="correction" else "",sid))
+    await q.answer("Decision recorded")
+    await q.edit_message_text((q.message.text or "")+f"\n\nDecision: {status.upper()} by {q.from_user.full_name}")
+    notice=(f"Your assignment '{r['assignment_key']}' has been approved. Well done!" if status=="approved" else f"Your assignment '{r['assignment_key']}' needs correction. Please contact your assignment admin for guidance.")
+    try: await ctx.bot.send_message(r['user_id'],notice)
+    except Exception: pass
 
 
 # ---------- admin ----------
@@ -1059,10 +1200,16 @@ def main():
     app.add_handler(CommandHandler("pay", pay_cmd))
     app.add_handler(CommandHandler("curriculum", curriculum_cmd))
     app.add_handler(CommandHandler("id", id_cmd))
+    app.add_handler(CommandHandler("chatid", chatid_cmd))
+    app.add_handler(CommandHandler("review", review_cmd))
+    app.add_handler(CommandHandler("admin", lambda update, ctx: send_admin_dashboard(ctx, update.effective_user.id) if update.effective_user.id in ADMIN_IDS else None))
     app.add_handler(CommandHandler("certificate", certificate_cmd))
     app.add_handler(CommandHandler("status", status_cmd))
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CallbackQueryHandler(menu_callback, pattern=r"^(menu:|rules:|faq:|faqanswer:|assignment:).+"))
+    app.add_handler(CallbackQueryHandler(admin_dashboard_callback, pattern=r"^admin:"))
+    app.add_handler(CallbackQueryHandler(review_open_callback, pattern=r"^reviewopen:\d+$"))
+    app.add_handler(CallbackQueryHandler(assignment_review_decision, pattern=r"^assignmentreview:(approve|correction):\d+$"))
     app.add_handler(CallbackQueryHandler(moderation_decision, pattern=r"^mod:(remove|dismiss):\d+$"))
     app.add_handler(CallbackQueryHandler(support_decision, pattern=r"^supportdone:\d+$"))
     app.add_handler(MessageHandler(filters.ChatType.PRIVATE & (filters.TEXT | filters.PHOTO | filters.Document.ALL) & ~filters.COMMAND, student_private_message), group=2)
