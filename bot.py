@@ -36,7 +36,7 @@ ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip()}
 PROGRAM = os.getenv("PROGRAM_NAME", "AI Video & Movie Making Training")
 PRICE_FULL = int(os.getenv("PRICE_FULL", "5000"))
 PRICE_HALF = int(os.getenv("PRICE_HALF", "2500"))
-BANK_DETAILS = os.getenv("BANK_DETAILS", "Bank: ____\nAccount name: ____\nAccount number: ____")
+BANK_DETAILS = os.getenv("BANK_DETAILS", "Bank: First Bank\nAccount name: Blessed Shima Kpete\nAccount number: 3231296192")
 PAY_LINK = os.getenv("PAY_LINK", "")
 CLASS_LINK = os.getenv("CLASS_LINK", "")
 CLASS_LINK_2 = os.getenv("CLASS_LINK_2", "")
@@ -95,6 +95,8 @@ def init_db():
             c.execute("ALTER TABLE students ADD COLUMN rules_accepted_at TEXT")
         if "rules_version" not in cols:
             c.execute("ALTER TABLE students ADD COLUMN rules_version TEXT")
+        if "registration_pack_sent_at" not in cols:
+            c.execute("ALTER TABLE students ADD COLUMN registration_pack_sent_at TEXT")
         c.executescript("""
             CREATE TABLE IF NOT EXISTS moderation_reports (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -158,6 +160,7 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if not rules_accepted(uid):
             await send_rules_page(ctx, uid, 0)
         else:
+            await send_registration_pack(ctx, uid)
             await send_student_menu(ctx, uid, f"Welcome back, {s['name']}!")
         return ConversationHandler.END
 
@@ -275,25 +278,12 @@ async def got_category(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     await ctx.bot.send_message(
         u.id,
-        f"Thank you, {d['name']} — that means a lot, and we can already tell you're serious "
-        f"about this. Welcome to the {PROGRAM}! 🎬\n\n"
-        "Here's your student ID card and our full curriculum.",
+        f"Thank you, {d['name']}! Welcome to {PROGRAM}.\n\n"
+        "Before we send your student ID, official course outline, and crash-course WhatsApp link, "
+        "please read and accept all sections of the Academy Rules & Regulations below.",
     )
-
-    try:
-        id_card = cards.generate_id_card(d["name"], cat, student_no, PROGRAM)
-        await ctx.bot.send_photo(u.id, id_card, caption=f"🪪 Your student ID — {student_no}")
-    except Exception as e:
-        log.warning("Could not generate/send ID card: %s", e)
-
-    await send_curriculum_to(ctx, u.id)
-
-    # Class access is gated by mandatory rules acceptance. Do not send class links here.
+    # Mandatory gate: ID, curriculum and crash-course link are withheld until rules acceptance.
     await send_rules_page(ctx, u.id, 0)
-
-    await ctx.bot.send_message(
-        u.id, f"Good luck, {d['name']} — we're rooting for you already. See you soon! 🎉"
-    )
 
     if referred_by:
         await maybe_send_referral_bonus(ctx, referred_by)
@@ -362,7 +352,38 @@ async def send_curriculum_to(ctx, uid):
 
 
 async def curriculum_cmd(update, ctx):
-    await send_curriculum_to(ctx, update.effective_user.id)
+    uid = update.effective_user.id
+    if not rules_accepted(uid):
+        await send_rules_page(ctx, uid, 0)
+        return
+    await send_curriculum_to(ctx, uid)
+
+
+async def send_registration_pack(ctx, uid):
+    """Send student ID, official curriculum and crash-course WhatsApp link once rules are accepted."""
+    s = get_student(uid)
+    if not s or not rules_accepted(uid):
+        return
+    if s["registration_pack_sent_at"]:
+        return
+    await ctx.bot.send_message(
+        uid,
+        f"Rules accepted. Your registration is complete!\n\nStudent ID: {s['student_no']}\n"
+        "Here is your student ID card, official course outline, and crash-course WhatsApp link.",
+    )
+    try:
+        id_card = cards.generate_id_card(s["name"], s["category"], s["student_no"], PROGRAM)
+        await ctx.bot.send_photo(uid, id_card, caption=f"Your Heribhee Academy Student ID — {s['student_no']}")
+    except Exception as e:
+        log.warning("Could not generate/send ID card: %s", e)
+        await ctx.bot.send_message(uid, f"Your student ID is: {s['student_no']}")
+    await send_curriculum_to(ctx, uid)
+    if WHATSAPP_LINK:
+        await ctx.bot.send_message(uid, f"Crash-course WhatsApp group link (for registered students):\n{WHATSAPP_LINK}\n\nPlease do not share this link.")
+    else:
+        await ctx.bot.send_message(uid, "Your crash-course WhatsApp link is not configured yet. Please contact an Academy admin.")
+    with db() as c:
+        c.execute("UPDATE students SET registration_pack_sent_at=? WHERE user_id=?", (now().isoformat(), uid))
 
 
 async def cancel(update, ctx):
@@ -394,9 +415,13 @@ async def send_payment_instructions(message, ctx, uid):
 
 
 async def pay_cmd(update, ctx):
-    s = get_student(update.effective_user.id)
+    uid = update.effective_user.id
+    s = get_student(uid)
     if not s:
         await update.message.reply_text("Please register first with /start.")
+        return
+    if not rules_accepted(uid):
+        await send_rules_page(ctx, uid, 0)
         return
     if not s["plan"]:
         kb = InlineKeyboardMarkup(
@@ -476,7 +501,7 @@ async def review_payment(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await q.answer("Rejected")
             await q.edit_message_caption((q.message.caption or "") + "\n\nREJECTED")
             await ctx.bot.send_message(
-                p["user_id"], "We couldn't confirm your payment. Please check and send a clear receipt with /pay."
+                p["user_id"], "We couldn't confirm your transfer. Please check the details and submit a clear receipt again through Payment & Status in the bot."
             )
             return
         c.execute("UPDATE payments SET status='approved' WHERE id=?", (pid,))
@@ -493,11 +518,12 @@ async def review_payment(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await q.answer("Approved")
     await q.edit_message_caption((q.message.caption or "") + "\n\nAPPROVED")
     if status == "paid":
-        msg = "Payment confirmed. You're fully paid! Please review and accept the Academy Rules & Regulations to receive your class access."
+        msg = "Payment confirmed. You're fully paid! Open My Classes in the student menu to access the paid class."
     else:
-        msg = f"Payment confirmed. Your balance of N{PRICE_FULL - paid:,} is due within 7 days to unlock the second half. Please review and accept the Academy Rules & Regulations."
+        msg = f"Payment confirmed. You have paid ₦{paid:,}; your remaining balance is ₦{PRICE_FULL - paid:,}. Open Payment & Status whenever you're ready to pay the balance."
     await ctx.bot.send_message(p["user_id"], msg)
-    await send_rules_page(ctx, p["user_id"], 0)
+    if rules_accepted(p["user_id"]):
+        await deliver_class_access(ctx, p["user_id"])
 
 
 async def status_cmd(update, ctx):
@@ -506,7 +532,7 @@ async def status_cmd(update, ctx):
         await update.message.reply_text("You're not registered yet. Send /start.")
         return
     await update.message.reply_text(
-        f"Status: {s['status']}\nPaid: N{s['paid_amount']:,} of N{PRICE_FULL:,}\nUse /pay to pay the balance."
+        f"Student ID: {s['student_no']}\nStatus: {s['status']}\nPaid: ₦{s['paid_amount']:,} of ₦{PRICE_FULL:,}\nBalance: ₦{max(PRICE_FULL - s['paid_amount'], 0):,}\n\n{BANK_DETAILS}\n\nUse Payment & Status in the menu to submit your receipt."
     )
 
 
@@ -683,6 +709,7 @@ async def menu_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         with db() as c:
             c.execute("UPDATE students SET rules_accepted_at=?, rules_version=? WHERE user_id=?", (now().isoformat(), RULES_VERSION, uid))
         await q.message.reply_text("Thank you. Your acceptance has been recorded.")
+        await send_registration_pack(ctx, uid)
         await deliver_class_access(ctx, uid)
         await send_student_menu(ctx, uid)
         return
@@ -735,8 +762,24 @@ async def menu_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await q.message.reply_text("Certification requires the final project and at least four assignments. Use My Progress to check recorded submissions."); return
     if data == "menu:status":
         s=get_student(uid)
-        if not s: await q.message.reply_text("Please register first with /start."); return
-        await q.message.reply_text(f"Status: {s['status']}\nPaid: N{s['paid_amount']:,} of N{PRICE_FULL:,}\nRules accepted: {'Yes' if rules_accepted(uid) else 'No'}"); return
+        if not s:
+            await q.message.reply_text("Please register first with /start."); return
+        paid = int(s["paid_amount"] or 0)
+        balance = max(PRICE_FULL - paid, 0)
+        status_label = {"registered": "Not paid", "part_paid": "Part payment received", "paid": "Fully paid"}.get(s["status"], s["status"])
+        pay_kb = []
+        if balance > 0:
+            pay_kb.append([InlineKeyboardButton(f"Pay in full (₦{PRICE_FULL:,})", callback_data="plan:full")])
+            if paid == 0:
+                pay_kb.append([InlineKeyboardButton(f"Pay first instalment (₦{PRICE_HALF:,})", callback_data="plan:two")])
+            else:
+                pay_kb.append([InlineKeyboardButton(f"Pay remaining balance (₦{balance:,})", callback_data="plan:two")])
+        pay_kb.append([InlineKeyboardButton("Main menu", callback_data="menu:home")])
+        msg = (f"PAYMENT & STATUS\n\nStudent ID: {s['student_no']}\nPayment status: {status_label}\n"
+               f"Amount paid: ₦{paid:,} of ₦{PRICE_FULL:,}\nBalance: ₦{balance:,}\n\n"
+               f"Bank details\n{BANK_DETAILS}\n\nAfter transferring, choose a payment option and send your transfer receipt here in the bot. "
+               "An Academy admin will verify it manually.")
+        await q.message.reply_text(msg, reply_markup=InlineKeyboardMarkup(pay_kb)); return
 
 
 async def deliver_class_access(ctx, uid):
