@@ -3,7 +3,11 @@ import csv
 import io
 import logging
 import os
-import sqlite3
+from contextlib import asynccontextmanager
+
+import psycopg
+from psycopg.rows import dict_row
+from fastapi import FastAPI, HTTPException, Request
 from datetime import datetime, time, timedelta
 from zoneinfo import ZoneInfo
 
@@ -44,7 +48,9 @@ CLASS_LINK = os.getenv("CLASS_LINK", "")
 CLASS_LINK_2 = os.getenv("CLASS_LINK_2", "")
 CLASS_GROUP_ID = int(os.getenv("CLASS_GROUP_ID", "0") or 0)
 RULES_VERSION = os.getenv("RULES_VERSION", "2026-09-v1")
-DB_PATH = os.getenv("DB_PATH", "students.db")
+DATABASE_URL = os.environ["DATABASE_URL"]
+WEBHOOK_URL = os.getenv("WEBHOOK_URL", "").rstrip("/")
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "")
 CURRICULUM_FILE = os.getenv("CURRICULUM_FILE", "curriculum.pdf")
 LOGO_FILE = os.getenv("LOGO_FILE", "logo.png")
 WHATSAPP_LINK = os.getenv("WHATSAPP_LINK", "https://chat.whatsapp.com/LwlosE8KbTBCIh5oM0JKCD")
@@ -58,77 +64,62 @@ CATEGORIES = ["Student", "Business owner", "Knowledge seeker", "Income seeker"]
 
 
 # ---------- database ----------
+def _normalize_row(row):
+    if row is None:
+        return None
+    out = dict(row)
+    for key, value in list(out.items()):
+        if isinstance(value, datetime):
+            out[key] = value.isoformat()
+    return out
+
+
+class CursorResult:
+    def __init__(self, cursor):
+        self.cursor = cursor
+
+    def fetchone(self):
+        return _normalize_row(self.cursor.fetchone())
+
+    def fetchall(self):
+        return [_normalize_row(r) for r in self.cursor.fetchall()]
+
+
+class DatabaseConnection:
+    def __init__(self):
+        self.conn = None
+
+    def __enter__(self):
+        self.conn = psycopg.connect(DATABASE_URL, row_factory=dict_row)
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        if self.conn is not None:
+            if exc_type is None:
+                self.conn.commit()
+            else:
+                self.conn.rollback()
+            self.conn.close()
+        return False
+
+    def execute(self, query, params=None):
+        # The original bot used SQLite-style '?' placeholders. Convert them
+        # centrally so the rest of the bot stays readable while using Postgres.
+        query = query.replace("?", "%s")
+        return CursorResult(self.conn.execute(query, params or ()))
+
+
 def db():
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn
+    return DatabaseConnection()
 
 
 def init_db():
+    # Tables are created in Supabase using heribhee_supabase_schema.sql.
+    # At startup we only verify that the database is reachable and the core
+    # table exists. This avoids destructive schema changes during a deploy.
     with db() as c:
-        c.executescript(
-            """
-            CREATE TABLE IF NOT EXISTS students (
-                user_id INTEGER PRIMARY KEY,
-                username TEXT, name TEXT, age TEXT, phone TEXT, email TEXT,
-                found_us TEXT, goal TEXT, motivation TEXT,
-                category TEXT, source TEXT, plan TEXT,
-                student_no TEXT,
-                status TEXT DEFAULT 'registered',
-                paid_amount INTEGER DEFAULT 0,
-                registered_at TEXT, second_due TEXT, last_reminded TEXT,
-                completed_at TEXT
-            );
-            CREATE TABLE IF NOT EXISTS payments (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER, amount INTEGER, proof_file_id TEXT,
-                status TEXT DEFAULT 'pending', created_at TEXT
-            );
-            """
-        )
-        # safe additive migration for referral tracking (won't error on an
-        # already-populated live database that predates these columns)
-        cols = {r["name"] for r in c.execute("PRAGMA table_info(students)").fetchall()}
-        if "referred_by" not in cols:
-            c.execute("ALTER TABLE students ADD COLUMN referred_by TEXT")
-        if "bonus_sent" not in cols:
-            c.execute("ALTER TABLE students ADD COLUMN bonus_sent INTEGER DEFAULT 0")
-        if "rules_accepted_at" not in cols:
-            c.execute("ALTER TABLE students ADD COLUMN rules_accepted_at TEXT")
-        if "rules_version" not in cols:
-            c.execute("ALTER TABLE students ADD COLUMN rules_version TEXT")
-        if "registration_pack_sent_at" not in cols:
-            c.execute("ALTER TABLE students ADD COLUMN registration_pack_sent_at TEXT")
-        # Add review fields to older databases safely.
-        subcols = {r["name"] for r in c.execute("PRAGMA table_info(assignment_submissions)").fetchall()}
-        for col, declaration in {
-            "review_status": "TEXT DEFAULT 'pending'", "reviewed_by": "INTEGER",
-            "reviewed_at": "TEXT", "review_note": "TEXT"
-        }.items():
-            if col not in subcols:
-                c.execute(f"ALTER TABLE assignment_submissions ADD COLUMN {col} {declaration}")
-        c.executescript("""
-            CREATE TABLE IF NOT EXISTS moderation_reports (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                chat_id INTEGER, message_id INTEGER, user_id INTEGER,
-                username TEXT, display_name TEXT, message_text TEXT,
-                detected_terms TEXT, status TEXT DEFAULT 'pending',
-                created_at TEXT, reviewed_by INTEGER, reviewed_at TEXT, decision TEXT
-            );
-            CREATE TABLE IF NOT EXISTS assignment_submissions (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER NOT NULL, assignment_key TEXT NOT NULL,
-                file_id TEXT, text TEXT, submitted_at TEXT NOT NULL,
-                review_status TEXT DEFAULT 'pending', reviewed_by INTEGER,
-                reviewed_at TEXT, review_note TEXT,
-                UNIQUE(user_id, assignment_key)
-            );
-            CREATE TABLE IF NOT EXISTS support_tickets (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER, message TEXT, status TEXT DEFAULT 'open',
-                created_at TEXT, handled_by INTEGER
-            );
-        """)
+        c.execute("SELECT user_id FROM students LIMIT 1").fetchall()
+    log.info("Supabase/PostgreSQL database connection verified")
 
 
 def get_student(uid):
@@ -139,7 +130,7 @@ def get_student(uid):
 def get_student_by_no(student_no):
     with db() as c:
         return c.execute(
-            "SELECT * FROM students WHERE student_no=? COLLATE NOCASE", (student_no,)
+            "SELECT * FROM students WHERE student_no ILIKE ?", (student_no,)
         ).fetchone()
 
 
@@ -150,7 +141,7 @@ def now():
 def referral_count(student_no):
     with db() as c:
         return c.execute(
-            "SELECT COUNT(*) n FROM students WHERE referred_by=? COLLATE NOCASE",
+            "SELECT COUNT(*) n FROM students WHERE referred_by ILIKE ?",
             (student_no,),
         ).fetchone()["n"]
 
@@ -279,11 +270,16 @@ async def got_category(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         next_no = c.execute("SELECT COUNT(*) n FROM students").fetchone()["n"] + 1
         student_no = f"HB-{next_no:04d}"
         c.execute(
-            """INSERT OR REPLACE INTO students
+            """INSERT INTO students
                (user_id, username, name, age, phone, email, found_us, goal, motivation,
                 category, source, plan, student_no, status, paid_amount, registered_at,
                 referred_by, bonus_sent)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,NULL,?,'registered',0,?,?,0)""",
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,NULL,?,'registered',0,?,?,FALSE)
+               ON CONFLICT (user_id) DO UPDATE SET
+                 username=EXCLUDED.username, name=EXCLUDED.name, age=EXCLUDED.age,
+                 phone=EXCLUDED.phone, email=EXCLUDED.email, found_us=EXCLUDED.found_us,
+                 goal=EXCLUDED.goal, motivation=EXCLUDED.motivation, category=EXCLUDED.category,
+                 source=EXCLUDED.source, referred_by=EXCLUDED.referred_by""",
             (u.id, u.username, d["name"], d["age"], d["phone"], d["email"],
              d["found_us"], d["goal"], d["motivation"], cat,
              d.get("source", "direct"), student_no, now().isoformat(), referred_by),
@@ -318,13 +314,13 @@ async def maybe_send_referral_bonus(ctx, referrer_no):
     # whether a free-access slot is still available
     with db() as c:
         granted_so_far = c.execute(
-            "SELECT COUNT(*) n FROM students WHERE bonus_sent=1"
+            "SELECT COUNT(*) n FROM students WHERE bonus_sent=TRUE"
         ).fetchone()["n"]
 
     if granted_so_far < REFERRAL_FREE_ACCESS_CAP:
         with db() as c:
             c.execute(
-                "UPDATE students SET bonus_sent=1, status='paid', paid_amount=?, second_due=NULL WHERE student_no=?",
+                "UPDATE students SET bonus_sent=TRUE, status='paid', paid_amount=?, second_due=NULL WHERE student_no=?",
                 (PRICE_FULL, referrer_no),
             )
         msg = (
@@ -338,7 +334,7 @@ async def maybe_send_referral_bonus(ctx, referrer_no):
             log.warning("Could not notify %s of free access: %s", referrer["user_id"], e)
     else:
         with db() as c:
-            c.execute("UPDATE students SET bonus_sent=1 WHERE student_no=?", (referrer_no,))
+            c.execute("UPDATE students SET bonus_sent=TRUE WHERE student_no=?", (referrer_no,))
         try:
             await ctx.bot.send_message(
                 referrer["user_id"],
@@ -478,10 +474,10 @@ async def got_proof(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     )
     with db() as c:
         cur = c.execute(
-            "INSERT INTO payments (user_id, amount, proof_file_id, created_at) VALUES (?,?,?,?)",
+            "INSERT INTO payments (user_id, amount, proof_file_id, created_at) VALUES (?,?,?,?) RETURNING id",
             (uid, amount, file_id, now().isoformat()),
         )
-        pid = cur.lastrowid
+        pid = cur.fetchone()["id"]
     ctx.user_data.pop("awaiting_proof", None)
     await update.message.reply_text("Received! We'll confirm your payment shortly.")
     kb = InlineKeyboardMarkup(
@@ -556,16 +552,23 @@ async def certificate_cmd(update, ctx):
     if not s:
         await update.message.reply_text("You're not registered yet. Send /start.")
         return
-    if s["status"] != "completed":
+    if s["status"] != "completed" and not s["certificate_eligible"]:
         await update.message.reply_text(
-            "Your certificate unlocks once you've completed the training — hang tight, "
-            "your instructor will mark you as done at the end of the program."
+            "Your certificate unlocks once you've completed the training and your eligibility is confirmed."
         )
         return
     try:
-        date_str = datetime.fromisoformat(s["completed_at"]).strftime("%d %b %Y") if s["completed_at"] else now().strftime("%d %b %Y")
+        issued = s["certificate_issued_at"] or s["completed_at"] or now().isoformat()
+        date_str = datetime.fromisoformat(issued).strftime("%d %b %Y")
+        cert_no = s["certificate_number"] or f"HB-CERT-{s['student_no'].replace('HB-','')}"
+        if not s["certificate_number"] or not s["certificate_issued_at"]:
+            with db() as c:
+                c.execute(
+                    "UPDATE students SET certificate_eligible=TRUE, certificate_number=?, certificate_issued_at=? WHERE user_id=?",
+                    (cert_no, issued, s["user_id"]),
+                )
         cert = cards.generate_certificate(s["name"], PROGRAM, date_str)
-        await update.message.reply_photo(cert, caption="🎓 Congratulations! Here's your certificate.")
+        await update.message.reply_photo(cert, caption=f"🎓 Congratulations! Certificate No: {cert_no}")
     except Exception as e:
         log.warning("Could not generate certificate: %s", e)
         await update.message.reply_text("Sorry, something went wrong generating your certificate. Try again shortly.")
@@ -638,7 +641,7 @@ async def leaderboard_cmd(update, ctx):
         rows = c.execute(
             """SELECT referred_by, COUNT(*) n FROM students
                WHERE referred_by IS NOT NULL AND referred_by != ''
-               GROUP BY referred_by COLLATE NOCASE ORDER BY n DESC LIMIT 10"""
+               GROUP BY referred_by ORDER BY n DESC LIMIT 10"""
         ).fetchall()
     if not rows:
         await update.message.reply_text("No referrals yet — be the first! Use /refer to get your link.")
@@ -770,11 +773,14 @@ async def menu_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await q.message.reply_text("Assignment deadlines (Nigeria time):\n• Monday task — Tuesday, 6 PM\n• Tuesday task — Thursday, 6 PM\n• Thursday task — Friday, 5 PM\n• Friday milestone — Sunday, 11:59 PM\n\nSubmit before the stated deadline. Use Ask Admin if you need help with a submission.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Submit assignment", callback_data="assignment:submitinfo")],[InlineKeyboardButton("Main menu", callback_data="menu:home")]])); return
     if data == "assignment:submitinfo":
         ctx.user_data["awaiting_assignment"] = True
-        await q.message.reply_text("Send your assignment as a document, photo, or text in this private chat. Include the assignment name in your message/caption. Your submission will be recorded for admin review.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Cancel", callback_data="menu:home")]])); return
+        await q.message.reply_text("Send your assignment as a document, photo, video, or text in this private chat. Include the assignment name in your message/caption. Your submission will be recorded for admin review.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Cancel", callback_data="menu:home")]])); return
     if data == "menu:progress":
         with db() as c:
-            rows = c.execute("SELECT assignment_key, submitted_at FROM assignment_submissions WHERE user_id=? ORDER BY submitted_at", (uid,)).fetchall()
-        text = "Your recorded submissions:\n" + ("\n".join(f"• {r['assignment_key']} — {r['submitted_at'][:16].replace('T',' ')}" for r in rows) if rows else "No assignments recorded yet.")
+            rows = c.execute("SELECT assignment_key, submitted_at, review_status FROM assignment_submissions WHERE user_id=? ORDER BY submitted_at", (uid,)).fetchall()
+        text = "Your recorded submissions:\n" + ("\n".join(
+            f"• {r['assignment_key']} — {r['submitted_at'][:16].replace('T',' ')} — {str(r['review_status'] or 'pending').replace('_',' ').title()}"
+            for r in rows
+        ) if rows else "No assignments recorded yet.")
         await q.message.reply_text(text, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Main menu", callback_data="menu:home")]])); return
     if data == "menu:ask":
         ctx.user_data["awaiting_support"] = True
@@ -835,8 +841,8 @@ async def student_private_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE
     if ctx.user_data.get("awaiting_support"):
         text = (msg.text or msg.caption or "[attachment]")[:3500]
         with db() as c:
-            cur = c.execute("INSERT INTO support_tickets(user_id,message,created_at) VALUES(?,?,?)", (uid,text,now().isoformat()))
-            tid = cur.lastrowid
+            cur = c.execute("INSERT INTO support_tickets(user_id,message,created_at) VALUES(?,?,?) RETURNING id", (uid,text,now().isoformat()))
+            tid = cur.fetchone()["id"]
         s = get_student(uid)
         for admin in ADMIN_IDS:
             await ctx.bot.send_message(admin, f"Support ticket #{tid}\nStudent: {s['name']} ({s['student_no']})\nTelegram: {uid}\n\n{text}", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Mark handled", callback_data=f"supportdone:{tid}")]]))
@@ -847,21 +853,41 @@ async def student_private_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE
         s = get_student(uid)
         caption = (msg.caption or msg.text or "").strip()
         key = caption[:100] if caption else "Unlabelled assignment"
-        file_id = msg.document.file_id if msg.document else (msg.photo[-1].file_id if msg.photo else None)
+        file_id = (
+            msg.document.file_id if msg.document else
+            (msg.photo[-1].file_id if msg.photo else
+             (msg.video.file_id if msg.video else None))
+        )
         with db() as c:
-            c.execute("INSERT OR REPLACE INTO assignment_submissions(user_id,assignment_key,file_id,text,submitted_at) VALUES(?,?,?,?,?)", (uid,key,file_id,caption,now().isoformat()))
+            c.execute("""INSERT INTO assignment_submissions(user_id,assignment_key,file_id,text,submitted_at) VALUES(?,?,?,?,?)
+                       ON CONFLICT (user_id, assignment_key) DO UPDATE SET
+                         file_id=EXCLUDED.file_id, text=EXCLUDED.text, submitted_at=EXCLUDED.submitted_at,
+                         review_status='pending', reviewed_by=NULL, reviewed_at=NULL, review_note=NULL""",
+                      (uid,key,file_id,caption,now().isoformat()))
         ctx.user_data.pop("awaiting_assignment",None)
         await msg.reply_text(f"Your submission for '{key}' has been recorded for review.")
         recipients = [ADMIN_GROUP_ID] if ADMIN_GROUP_ID else list(ADMIN_IDS)
         header = (f"Assignment submission\nStudent: {s['name']} ({s['student_no']})\n"
                   f"Task: {key}\nSubmitted: {now().isoformat()}\nTelegram ID: {uid}")
+        with db() as c:
+            submission = c.execute(
+                "SELECT id FROM assignment_submissions WHERE user_id=? AND assignment_key=?",
+                (uid, key),
+            ).fetchone()
+        sid = submission["id"] if submission else None
+        review_kb = InlineKeyboardMarkup([[
+            InlineKeyboardButton("Approve", callback_data=f"assignmentreview:approve:{sid}"),
+            InlineKeyboardButton("Request correction", callback_data=f"assignmentreview:correction:{sid}"),
+        ]]) if sid else None
         for recipient in recipients:
-            await ctx.bot.send_message(recipient, header)
+            await ctx.bot.send_message(recipient, header, reply_markup=review_kb)
             if file_id:
                 if msg.document:
                     await ctx.bot.send_document(recipient, file_id, caption=f"{s['student_no']} — {key}")
                 elif msg.photo:
                     await ctx.bot.send_photo(recipient, file_id, caption=f"{s['student_no']} — {key}")
+                elif msg.video:
+                    await ctx.bot.send_video(recipient, file_id, caption=f"{s['student_no']} — {key}")
             elif caption:
                 await ctx.bot.send_message(recipient, caption)
         return
@@ -891,8 +917,8 @@ async def group_moderation(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         log.warning("Could not delete flagged message: %s", e)
     display = user.full_name or str(user.id)
     with db() as c:
-        cur = c.execute("INSERT INTO moderation_reports(chat_id,message_id,user_id,username,display_name,message_text,detected_terms,created_at) VALUES(?,?,?,?,?,?,?,?)", (msg.chat_id,msg.message_id,user.id,user.username,display,text[:3000],", ".join(hits),now().isoformat()))
-        rid = cur.lastrowid
+        cur = c.execute("INSERT INTO moderation_reports(chat_id,message_id,user_id,username,display_name,message_text,detected_terms,created_at) VALUES(?,?,?,?,?,?,?,?) RETURNING id", (msg.chat_id,msg.message_id,user.id,user.username,display,text[:3000],", ".join(hits),now().isoformat()))
+        rid = cur.fetchone()["id"]
     kb = InlineKeyboardMarkup([[InlineKeyboardButton("Confirm removal", callback_data=f"mod:remove:{rid}"),InlineKeyboardButton("Dismiss", callback_data=f"mod:dismiss:{rid}")]])
     for admin in ADMIN_IDS:
         try:
@@ -940,10 +966,12 @@ async def support_decision(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 # ---------- admin dashboard and assignment review ----------
 def admin_dashboard_keyboard():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("Student list", callback_data="admin:students:0"), InlineKeyboardButton("Assignment overview", callback_data="admin:assignments")],
-        [InlineKeyboardButton("Pending reviews", callback_data="admin:pending:0"), InlineKeyboardButton("Certification overview", callback_data="admin:certs")],
-        [InlineKeyboardButton("Stats", callback_data="admin:stats"), InlineKeyboardButton("Export students", callback_data="admin:export")],
-        [InlineKeyboardButton("Show my Telegram ID", callback_data="admin:myid")],
+        [InlineKeyboardButton("👨‍🎓 Students", callback_data="admin:students:0"), InlineKeyboardButton("💳 Payments", callback_data="admin:payments:0")],
+        [InlineKeyboardButton("📝 Assignments", callback_data="admin:assignments"), InlineKeyboardButton("✅ Pending reviews", callback_data="admin:pending:0")],
+        [InlineKeyboardButton("🎓 Certificates", callback_data="admin:certs"), InlineKeyboardButton("👥 Referrals", callback_data="admin:referrals")],
+        [InlineKeyboardButton("💬 Support questions", callback_data="admin:support:0"), InlineKeyboardButton("📢 Message students", callback_data="admin:message")],
+        [InlineKeyboardButton("📊 Statistics", callback_data="admin:stats"), InlineKeyboardButton("📁 Export records", callback_data="admin:export")],
+        [InlineKeyboardButton("🆔 Show my Telegram ID", callback_data="admin:myid")],
     ])
 
 
@@ -978,6 +1006,44 @@ async def admin_dashboard_callback(update, ctx):
             for r in rows: w.writerow(list(r))
         out=io.BytesIO(buf.getvalue().encode()); out.name="students.csv"
         await q.message.reply_document(out,caption="Student database export"); return
+    if data.startswith("admin:payments:"):
+        offset=int(data.rsplit(":",1)[1])
+        with db() as c:
+            rows=c.execute("""SELECT p.id,p.amount,p.status,p.created_at,s.name,s.student_no
+                              FROM payments p LEFT JOIN students s ON s.user_id=p.user_id
+                              ORDER BY p.created_at DESC LIMIT 12 OFFSET ?""",(offset,)).fetchall()
+        lines=[f"#{r['id']} — {r['name'] or 'Unknown'} ({r['student_no'] or '-'}) — ₦{r['amount']:,} — {r['status']}" for r in rows]
+        kb=[]
+        if offset: kb.append([InlineKeyboardButton("Previous",callback_data=f"admin:payments:{max(0,offset-12)}")])
+        if len(rows)==12: kb.append([InlineKeyboardButton("Next",callback_data=f"admin:payments:{offset+12}")])
+        kb.append([InlineKeyboardButton("Admin dashboard",callback_data="admin:home")])
+        await q.message.reply_text("PAYMENTS\n\n"+("\n".join(lines) if lines else "No payment records yet."),reply_markup=InlineKeyboardMarkup(kb)); return
+    if data == "admin:referrals":
+        with db() as c:
+            rows=c.execute("""SELECT referred_by,COUNT(*) n FROM students
+                              WHERE referred_by IS NOT NULL AND referred_by!=''
+                              GROUP BY referred_by ORDER BY n DESC LIMIT 30""").fetchall()
+        lines=[]
+        for r in rows:
+            ref=get_student_by_no(r['referred_by'])
+            lines.append(f"{ref['name'] if ref else r['referred_by']} ({r['referred_by']}) — {r['n']} referral(s)")
+        await q.message.reply_text("REFERRALS\n\n"+("\n".join(lines) if lines else "No referrals yet."),reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Admin dashboard",callback_data="admin:home")]])); return
+    if data.startswith("admin:support:"):
+        offset=int(data.rsplit(":",1)[1])
+        with db() as c:
+            rows=c.execute("""SELECT t.id,t.message,t.status,t.created_at,s.name,s.student_no
+                              FROM support_tickets t LEFT JOIN students s ON s.user_id=t.user_id
+                              ORDER BY CASE WHEN t.status='open' THEN 0 ELSE 1 END,t.created_at DESC
+                              LIMIT 10 OFFSET ?""",(offset,)).fetchall()
+        if not rows:
+            await q.message.reply_text("No support tickets.",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Admin dashboard",callback_data="admin:home")]])); return
+        for r in rows:
+            kb=[[InlineKeyboardButton("Mark handled",callback_data=f"supportdone:{r['id']}")]] if r['status']=='open' else []
+            kb.append([InlineKeyboardButton("Admin dashboard",callback_data="admin:home")])
+            await q.message.reply_text(f"Ticket #{r['id']} — {r['status'].upper()}\nStudent: {r['name'] or 'Unknown'} ({r['student_no'] or '-'})\nCreated: {r['created_at']}\n\n{r['message']}",reply_markup=InlineKeyboardMarkup(kb))
+        return
+    if data == "admin:message":
+        await q.message.reply_text("MESSAGE STUDENTS\n\nUse one of these admin commands:\n/broadcast all <message>\n/broadcast paid <message>\n/broadcast unpaid <message>\n\nExample:\n/broadcast all Class starts by 8 PM tonight.",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Admin dashboard",callback_data="admin:home")]])); return
     if data == "admin:assignments":
         with db() as c:
             rows=c.execute("SELECT review_status,COUNT(*) n FROM assignment_submissions GROUP BY review_status").fetchall()
@@ -986,9 +1052,9 @@ async def admin_dashboard_callback(update, ctx):
         await q.message.reply_text(f"Assignment submissions: {total}\nPending: {counts.get('pending',0)}\nApproved: {counts.get('approved',0)}\nNeeds correction: {counts.get('correction',0)}",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Pending reviews",callback_data="admin:pending:0")],[InlineKeyboardButton("Admin dashboard",callback_data="admin:home")]])); return
     if data == "admin:certs":
         with db() as c:
-            rows=c.execute("SELECT s.name,s.student_no,COUNT(a.id) total,SUM(CASE WHEN a.review_status='approved' THEN 1 ELSE 0 END) approved FROM students s LEFT JOIN assignment_submissions a ON a.user_id=s.user_id GROUP BY s.user_id ORDER BY s.name").fetchall()
-        lines=["CERTIFICATION PROGRESS (reviewed assignment counts)"]
-        lines += [f"{r['name']} ({r['student_no']}): {r['approved'] or 0} approved / {r['total'] or 0} submitted" for r in rows[:60]]
+            rows=c.execute("SELECT s.name,s.student_no,s.certificate_eligible,s.certificate_number,COUNT(a.id) total,SUM(CASE WHEN a.review_status='approved' THEN 1 ELSE 0 END) approved FROM students s LEFT JOIN assignment_submissions a ON a.user_id=s.user_id GROUP BY s.user_id ORDER BY s.name").fetchall()
+        lines=["CERTIFICATION PROGRESS"]
+        lines += [f"{r['name']} ({r['student_no']}): {r['approved'] or 0} approved / {r['total'] or 0} submitted — {'ELIGIBLE' if r['certificate_eligible'] else 'Not yet eligible'}{(' — '+r['certificate_number']) if r['certificate_number'] else ''}" for r in rows[:60]]
         await q.message.reply_text("\n".join(lines) if len(lines)>1 else "No student records yet.",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Admin dashboard",callback_data="admin:home")]])); return
     if data.startswith("admin:students:"):
         offset=int(data.rsplit(":",1)[1])
@@ -1060,10 +1126,10 @@ async def stats(update, ctx):
         total = c.execute("SELECT COUNT(*) n FROM students").fetchone()["n"]
         by_status = c.execute("SELECT status, COUNT(*) n FROM students GROUP BY status").fetchall()
         by_source = c.execute(
-            "SELECT source, COUNT(*) n, SUM(paid_amount>0) payers FROM students GROUP BY source ORDER BY n DESC"
+            "SELECT source, COUNT(*) n, COUNT(*) FILTER (WHERE paid_amount>0) payers FROM students GROUP BY source ORDER BY n DESC"
         ).fetchall()
         by_cat = c.execute(
-            "SELECT category, COUNT(*) n, SUM(paid_amount>0) payers FROM students GROUP BY category"
+            "SELECT category, COUNT(*) n, COUNT(*) FILTER (WHERE paid_amount>0) payers FROM students GROUP BY category"
         ).fetchall()
         revenue = c.execute("SELECT COALESCE(SUM(paid_amount),0) r FROM students").fetchone()["r"]
     lines = [f"Registered: {total}", f"Revenue confirmed: N{revenue:,}", "", "By status:"]
@@ -1113,15 +1179,17 @@ async def complete_cmd(update, ctx):
         return
     uid = s["user_id"]
     with db() as c:
+        issued_at = now().isoformat()
+        cert_no = f"HB-CERT-{s['student_no'].replace('HB-','')}"
         c.execute(
-            "UPDATE students SET status='completed', completed_at=? WHERE user_id=?",
-            (now().isoformat(), uid),
+            "UPDATE students SET status='completed', completed_at=?, certificate_eligible=TRUE, certificate_issued_at=?, certificate_number=? WHERE user_id=?",
+            (issued_at, issued_at, cert_no, uid),
         )
     try:
         cert = cards.generate_certificate(s["name"], PROGRAM, now().strftime("%d %b %Y"))
         await ctx.bot.send_photo(
             uid, cert,
-            caption="🎓 Congratulations — you've completed the program! Here's your certificate."
+            caption=f"🎓 Congratulations — you've completed the program! Certificate No: {cert_no}"
         )
         await update.message.reply_text(f"Marked {s['name']} ({s['student_no']}) as completed and sent their certificate.")
     except Exception as e:
@@ -1179,8 +1247,7 @@ async def daily_reminders(ctx: ContextTypes.DEFAULT_TYPE):
             await asyncio.sleep(0.05)
 
 
-def main():
-    init_db()
+def build_telegram_application():
     app = Application.builder().token(BOT_TOKEN).build()
     form = ConversationHandler(
         entry_points=[CommandHandler("start", start)],
@@ -1212,7 +1279,7 @@ def main():
     app.add_handler(CallbackQueryHandler(assignment_review_decision, pattern=r"^assignmentreview:(approve|correction):\d+$"))
     app.add_handler(CallbackQueryHandler(moderation_decision, pattern=r"^mod:(remove|dismiss):\d+$"))
     app.add_handler(CallbackQueryHandler(support_decision, pattern=r"^supportdone:\d+$"))
-    app.add_handler(MessageHandler(filters.ChatType.PRIVATE & (filters.TEXT | filters.PHOTO | filters.Document.ALL) & ~filters.COMMAND, student_private_message), group=2)
+    app.add_handler(MessageHandler(filters.ChatType.PRIVATE & (filters.TEXT | filters.PHOTO | filters.VIDEO | filters.Document.ALL) & ~filters.COMMAND, student_private_message), group=2)
     app.add_handler(MessageHandler(filters.ChatType.GROUPS & (filters.TEXT | filters.CAPTION), group_moderation), group=1)
     app.add_handler(CommandHandler("refer", refer_cmd))
     app.add_handler(CommandHandler("leaderboard", leaderboard_cmd))
@@ -1224,8 +1291,51 @@ def main():
     app.add_handler(CallbackQueryHandler(choose_plan, pattern=r"^plan:(full|two)$"))
     app.add_handler(MessageHandler((filters.PHOTO | filters.Document.ALL) & filters.ChatType.PRIVATE, got_proof))
     app.job_queue.run_daily(daily_reminders, time=time(9, 0, tzinfo=TZ))
-    app.run_polling()
+    return app
 
 
-if __name__ == "__main__":
-    main()
+telegram_app = build_telegram_application()
+
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    init_db()
+    await telegram_app.initialize()
+    await telegram_app.start()
+
+    external_url = WEBHOOK_URL or os.getenv("RENDER_EXTERNAL_URL", "").rstrip("/")
+    if external_url:
+        webhook_url = external_url if external_url.endswith("/telegram") else external_url + "/telegram"
+        kwargs = {"url": webhook_url, "allowed_updates": Update.ALL_TYPES}
+        if WEBHOOK_SECRET:
+            kwargs["secret_token"] = WEBHOOK_SECRET
+        await telegram_app.bot.set_webhook(**kwargs)
+        log.info("Telegram webhook configured: %s", webhook_url)
+    else:
+        log.warning("No WEBHOOK_URL/RENDER_EXTERNAL_URL yet. Webhook will be set after Render provides the public URL.")
+
+    yield
+
+    await telegram_app.stop()
+    await telegram_app.shutdown()
+
+
+web = FastAPI(title="Heribhee Academy Bot", lifespan=lifespan)
+
+
+@web.get("/")
+@web.get("/health")
+async def health():
+    return {"status": "ok", "service": "Heribhee Academy Bot"}
+
+
+@web.post("/telegram")
+async def telegram_webhook(request: Request):
+    if WEBHOOK_SECRET:
+        supplied = request.headers.get("X-Telegram-Bot-Api-Secret-Token")
+        if supplied != WEBHOOK_SECRET:
+            raise HTTPException(status_code=403, detail="Invalid webhook secret")
+    data = await request.json()
+    update = Update.de_json(data, telegram_app.bot)
+    await telegram_app.process_update(update)
+    return {"ok": True}
