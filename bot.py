@@ -53,13 +53,15 @@ WEBHOOK_URL = os.getenv("WEBHOOK_URL", "").rstrip("/")
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "")
 CURRICULUM_FILE = os.getenv("CURRICULUM_FILE", "curriculum.pdf")
 LOGO_FILE = os.getenv("LOGO_FILE", "logo.png")
-WHATSAPP_LINK = os.getenv("WHATSAPP_LINK", "https://chat.whatsapp.com/LwlosE8KbTBCIh5oM0JKCD")
+WHATSAPP_LINK = os.getenv("WHATSAPP_LINK", "")  # legacy name kept for backwards compatibility
+CRASH_COURSE_LINK = os.getenv("CRASH_COURSE_LINK", WHATSAPP_LINK)
+PAID_CLASS_LINK = os.getenv("PAID_CLASS_LINK", os.getenv("CLASS_LINK_2", "") or os.getenv("CLASS_LINK", ""))
 BOT_USERNAME = os.getenv("BOT_USERNAME", "")
 REFERRAL_BONUS_THRESHOLD = int(os.getenv("REFERRAL_BONUS_THRESHOLD", "3"))
 REFERRAL_FREE_ACCESS_CAP = int(os.getenv("REFERRAL_FREE_ACCESS_CAP", "20"))
 TZ = ZoneInfo("Africa/Lagos")
 
-NAME, AGE, PHONE, EMAIL, FOUND_US, GOAL, MOTIVATION, CATEGORY = range(8)
+NAME, AGE, PHONE, EMAIL, FOUND_US, GOAL, OCCUPATION, MOTIVATION, CATEGORY = range(9)
 CATEGORIES = ["Student", "Business owner", "Knowledge seeker", "Income seeker"]
 
 
@@ -239,8 +241,22 @@ async def got_found_us(update, ctx):
 async def got_goal(update, ctx):
     ctx.user_data["goal"] = update.message.text.strip()[:500]
     await update.message.reply_text(
-        "Last one before the multiple choice — tell us a bit about yourself: what do you "
-        "currently do, and why does this training matter to you right now?"
+        "What do you currently do?\n\n"
+        "For example: Student, Fashion Designer, Business Owner, Video Editor, Teacher, "
+        "Photographer, Content Creator, Trader, Engineer, etc.\n\n"
+        "Please type your actual occupation, profession, business, or current role. This will appear on your student ID card."
+    )
+    return OCCUPATION
+
+
+async def got_occupation(update, ctx):
+    occupation = update.message.text.strip()[:120]
+    if len(occupation) < 2:
+        await update.message.reply_text("Please type what you currently do.")
+        return OCCUPATION
+    ctx.user_data["occupation"] = occupation
+    await update.message.reply_text(
+        "Why does this training matter to you right now? Tell us briefly what you hope it will help you achieve."
     )
     return MOTIVATION
 
@@ -271,17 +287,17 @@ async def got_category(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         student_no = f"HB-{next_no:04d}"
         c.execute(
             """INSERT INTO students
-               (user_id, username, name, age, phone, email, found_us, goal, motivation,
+               (user_id, username, name, age, phone, email, found_us, goal, occupation, motivation,
                 category, source, plan, student_no, status, paid_amount, registered_at,
                 referred_by, bonus_sent)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,NULL,?,'registered',0,?,?,FALSE)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,NULL,?,'registered',0,?,?,FALSE)
                ON CONFLICT (user_id) DO UPDATE SET
                  username=EXCLUDED.username, name=EXCLUDED.name, age=EXCLUDED.age,
                  phone=EXCLUDED.phone, email=EXCLUDED.email, found_us=EXCLUDED.found_us,
-                 goal=EXCLUDED.goal, motivation=EXCLUDED.motivation, category=EXCLUDED.category,
+                 goal=EXCLUDED.goal, occupation=EXCLUDED.occupation, motivation=EXCLUDED.motivation, category=EXCLUDED.category,
                  source=EXCLUDED.source, referred_by=EXCLUDED.referred_by""",
             (u.id, u.username, d["name"], d["age"], d["phone"], d["email"],
-             d["found_us"], d["goal"], d["motivation"], cat,
+             d["found_us"], d["goal"], d["occupation"], d["motivation"], cat,
              d.get("source", "direct"), student_no, now().isoformat(), referred_by),
         )
 
@@ -383,16 +399,20 @@ async def send_registration_pack(ctx, uid):
         "Here is your student ID card, official course outline, and crash-course WhatsApp link.",
     )
     try:
-        id_card = cards.generate_id_card(s["name"], s["category"], s["student_no"], PROGRAM)
+        id_card = cards.generate_id_card(s["name"], s.get("occupation") or s.get("category") or "Academy Student", s["student_no"], PROGRAM)
         await ctx.bot.send_photo(uid, id_card, caption=f"Your Heribhee Academy Student ID — {s['student_no']}")
     except Exception as e:
         log.warning("Could not generate/send ID card: %s", e)
         await ctx.bot.send_message(uid, f"Your student ID is: {s['student_no']}")
     await send_curriculum_to(ctx, uid)
-    if WHATSAPP_LINK:
-        await ctx.bot.send_message(uid, f"Crash-course WhatsApp group link (for registered students):\n{WHATSAPP_LINK}\n\nPlease do not share this link.")
+    if CRASH_COURSE_LINK:
+        await ctx.bot.send_message(
+            uid,
+            "🚀 FREE CRASH COURSE\n\nThis is your first classroom/landing group. Start here for the basics, orientation, and course introduction.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Join Crash Course", url=CRASH_COURSE_LINK)]])
+        )
     else:
-        await ctx.bot.send_message(uid, "Your crash-course WhatsApp link is not configured yet. Please contact an Academy admin.")
+        await ctx.bot.send_message(uid, "Your crash-course group link is not configured yet. Please contact an Academy admin.")
     with db() as c:
         c.execute("UPDATE students SET registration_pack_sent_at=? WHERE user_id=?", (now().isoformat(), uid))
 
@@ -567,7 +587,7 @@ async def certificate_cmd(update, ctx):
                     "UPDATE students SET certificate_eligible=TRUE, certificate_number=?, certificate_issued_at=? WHERE user_id=?",
                     (cert_no, issued, s["user_id"]),
                 )
-        cert = cards.generate_certificate(s["name"], PROGRAM, date_str)
+        cert = cards.generate_certificate(s["name"], PROGRAM, date_str, cert_no)
         await update.message.reply_photo(cert, caption=f"🎓 Congratulations! Certificate No: {cert_no}")
     except Exception as e:
         log.warning("Could not generate certificate: %s", e)
@@ -595,7 +615,7 @@ async def id_cmd(update, ctx):
         await update.message.reply_text("You're not registered yet. Send /start.")
         return
     try:
-        id_card = cards.generate_id_card(s["name"], s["category"], s["student_no"] or "HB-0000", PROGRAM)
+        id_card = cards.generate_id_card(s["name"], s.get("occupation") or s.get("category") or "Academy Student", s["student_no"] or "HB-0000", PROGRAM)
         await update.message.reply_photo(id_card, caption=f"🪪 Your student ID — {s['student_no']}")
     except Exception as e:
         log.warning("Could not generate ID card: %s", e)
@@ -826,11 +846,14 @@ async def deliver_class_access(ctx, uid):
         await send_rules_page(ctx, uid, 0); return
     if s["status"] != "paid" and not s["bonus_sent"]:
         await ctx.bot.send_message(uid, "Your class access is not yet unlocked. Please complete payment or check your status using /status."); return
-    link = CLASS_LINK_2 or CLASS_LINK
-    if link:
-        await ctx.bot.send_message(uid, f"Your class access link (please do not share it):\n{link}")
+    if PAID_CLASS_LINK:
+        await ctx.bot.send_message(
+            uid,
+            "✅ PAYMENT CONFIRMED — PAID CLASS UNLOCKED\n\nThis is the separate main class for fully paid students. Please do not share the invite link.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Join Paid Class", url=PAID_CLASS_LINK)]])
+        )
     else:
-        await ctx.bot.send_message(uid, "Your rules acceptance is recorded. The class invite link has not been configured yet; please contact an admin.")
+        await ctx.bot.send_message(uid, "Your payment/rules status is confirmed, but the paid-class link has not been configured yet. Please contact an Academy admin.")
 
 
 async def student_private_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -1186,7 +1209,7 @@ async def complete_cmd(update, ctx):
             (issued_at, issued_at, cert_no, uid),
         )
     try:
-        cert = cards.generate_certificate(s["name"], PROGRAM, now().strftime("%d %b %Y"))
+        cert = cards.generate_certificate(s["name"], PROGRAM, now().strftime("%d %b %Y"), cert_no)
         await ctx.bot.send_photo(
             uid, cert,
             caption=f"🎓 Congratulations — you've completed the program! Certificate No: {cert_no}"
@@ -1258,6 +1281,7 @@ def build_telegram_application():
             EMAIL: [MessageHandler(filters.TEXT & ~filters.COMMAND, got_email)],
             FOUND_US: [MessageHandler(filters.TEXT & ~filters.COMMAND, got_found_us)],
             GOAL: [MessageHandler(filters.TEXT & ~filters.COMMAND, got_goal)],
+            OCCUPATION: [MessageHandler(filters.TEXT & ~filters.COMMAND, got_occupation)],
             MOTIVATION: [MessageHandler(filters.TEXT & ~filters.COMMAND, got_motivation)],
             CATEGORY: [CallbackQueryHandler(got_category, pattern=r"^cat:\d+$")],
         },
