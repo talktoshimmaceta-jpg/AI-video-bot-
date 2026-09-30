@@ -179,14 +179,27 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             log.warning("Could not send logo: %s", e)
 
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("📝 Register as a New Student", callback_data="register:new")],
+        [InlineKeyboardButton("🔐 Recover Existing Student Account", callback_data="recover:start")],
+    ])
     await update.message.reply_text(
         f"Welcome to the {PROGRAM}! 🎬\n\n"
+        "If this is your first time here, choose Register as a New Student.\n\n"
+        "If you registered before but now use a different Telegram account, choose Recover Existing Student Account.",
+        reply_markup=kb,
+    )
+    return ConversationHandler.END
+
+
+async def begin_registration(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    await q.edit_message_text(
         "Before anything else, we'd like to get to know you properly — this isn't just a "
         "mailing list signup, it's a short application so we understand who's joining us "
         "and can support you better.\n\n"
-        "It's about a dozen questions and takes 2–3 minutes. Let's start:\n\n"
-        "What's your full name?",
-        reply_markup=ReplyKeyboardRemove(),
+        "It takes about 2–3 minutes. Let's start:\n\nWhat's your full name?"
     )
     return NAME
 
@@ -568,30 +581,11 @@ async def status_cmd(update, ctx):
 
 
 async def certificate_cmd(update, ctx):
-    s = get_student(update.effective_user.id)
-    if not s:
+    uid = update.effective_user.id
+    if not get_student(uid):
         await update.message.reply_text("You're not registered yet. Send /start.")
         return
-    if s["status"] != "completed" and not s["certificate_eligible"]:
-        await update.message.reply_text(
-            "Your certificate unlocks once you've completed the training and your eligibility is confirmed."
-        )
-        return
-    try:
-        issued = s["certificate_issued_at"] or s["completed_at"] or now().isoformat()
-        date_str = datetime.fromisoformat(issued).strftime("%d %b %Y")
-        cert_no = s["certificate_number"] or f"HB-CERT-{s['student_no'].replace('HB-','')}"
-        if not s["certificate_number"] or not s["certificate_issued_at"]:
-            with db() as c:
-                c.execute(
-                    "UPDATE students SET certificate_eligible=TRUE, certificate_number=?, certificate_issued_at=? WHERE user_id=?",
-                    (cert_no, issued, s["user_id"]),
-                )
-        cert = cards.generate_certificate(s["name"], PROGRAM, date_str, cert_no)
-        await update.message.reply_photo(cert, caption=f"🎓 Congratulations! Certificate No: {cert_no}")
-    except Exception as e:
-        log.warning("Could not generate certificate: %s", e)
-        await update.message.reply_text("Sorry, something went wrong generating your certificate. Try again shortly.")
+    await resend_issued_certificate(ctx, uid)
 
 
 async def review_cmd(update, ctx):
@@ -610,15 +604,10 @@ async def id_cmd(update, ctx):
     if update.effective_user.id in ADMIN_IDS:
         await update.message.reply_text(f"Your Telegram user ID: {update.effective_user.id}")
         return
-    s = get_student(update.effective_user.id)
-    if not s:
+    if not get_student(update.effective_user.id):
         await update.message.reply_text("You're not registered yet. Send /start.")
         return
-    try:
-        id_card = cards.generate_id_card(s["name"], s.get("occupation") or s.get("category") or "Academy Student", s["student_no"] or "HB-0000", PROGRAM)
-        await update.message.reply_photo(id_card, caption=f"🪪 Your student ID — {s['student_no']}")
-    except Exception as e:
-        log.warning("Could not generate ID card: %s", e)
+    await send_student_id_card(ctx, update.effective_user.id)
 
 
 async def refer_cmd(update, ctx):
@@ -719,13 +708,60 @@ def rules_accepted(uid):
     return bool(s and s["rules_accepted_at"] and s["rules_version"] == RULES_VERSION)
 
 
+async def send_student_id_card(ctx, uid):
+    s = get_student(uid)
+    if not s:
+        return False
+    try:
+        id_card = cards.generate_id_card(
+            s["name"],
+            s.get("occupation") or s.get("category") or "Academy Student",
+            s["student_no"] or "HB-0000",
+            PROGRAM,
+        )
+        await ctx.bot.send_photo(uid, id_card, caption=f"🪪 Your Heribhee Academy Student ID — {s['student_no']}")
+        return True
+    except Exception as e:
+        log.warning("Could not generate/send ID card: %s", e)
+        await ctx.bot.send_message(uid, f"Your student ID is: {s['student_no']}")
+        return False
+
+
+async def resend_issued_certificate(ctx, uid):
+    s = get_student(uid)
+    if not s:
+        return False
+    if not s.get("certificate_issued_at") or not s.get("certificate_number"):
+        await ctx.bot.send_message(
+            uid,
+            "Your certificate has not been issued by the Academy yet. Once it has been officially issued, you can re-download it here anytime."
+        )
+        return False
+    try:
+        date_str = datetime.fromisoformat(s["certificate_issued_at"]).strftime("%d %b %Y")
+        cert = cards.generate_certificate(s["name"], PROGRAM, date_str, s["certificate_number"])
+        await ctx.bot.send_photo(
+            uid, cert,
+            caption=f"🎓 Your certificate — {s['certificate_number']}\nYou can request this again anytime if you lose it or change devices."
+        )
+        return True
+    except Exception as e:
+        log.warning("Could not regenerate certificate: %s", e)
+        await ctx.bot.send_message(uid, "Sorry, something went wrong regenerating your certificate. Please try again later.")
+        return False
+
+
+def _clean_phone(value):
+    return "".join(ch for ch in (value or "") if ch.isdigit())
+
+
 def student_keyboard():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("📚 My Classes", callback_data="menu:classes"), InlineKeyboardButton("📝 Assignments", callback_data="menu:assignments")],
         [InlineKeyboardButton("❓ Help & FAQs", callback_data="menu:help"), InlineKeyboardButton("💬 Ask Admin", callback_data="menu:ask")],
         [InlineKeyboardButton("📈 My Progress", callback_data="menu:progress"), InlineKeyboardButton("📜 Rules & Regulations", callback_data="menu:rules")],
         [InlineKeyboardButton("👥 Refer a Friend", callback_data="menu:refer"), InlineKeyboardButton("🎓 Certification", callback_data="menu:cert")],
-        [InlineKeyboardButton("💳 Payment & Status", callback_data="menu:status")],
+        [InlineKeyboardButton("💳 Payment & Status", callback_data="menu:status"), InlineKeyboardButton("👤 My Profile & Documents", callback_data="menu:profile")],
     ])
 
 
@@ -747,6 +783,79 @@ async def send_rules_page(ctx, uid, page):
     else:
         keyboard.append([InlineKeyboardButton("Back to start", callback_data="rules:page:0")])
     await ctx.bot.send_message(uid, f"HERIBHEE ACADEMY — RULES & REGULATIONS\n\n{title}\n\n{body}\n\nPlease use the buttons to review every section.", reply_markup=InlineKeyboardMarkup(keyboard))
+
+
+async def show_profile(ctx, uid):
+    s = get_student(uid)
+    if not s:
+        await ctx.bot.send_message(uid, "Student record not found. Send /start.")
+        return
+    name_edit = "Used" if s.get("name_edit_used") else "Available once"
+    occupation_edit = "Used" if s.get("occupation_edit_used") else "Available once"
+    cert_status = "Issued — available for re-download" if s.get("certificate_issued_at") and s.get("certificate_number") else "Not issued yet"
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🪪 Get My ID Card", callback_data="profile:id")],
+        [InlineKeyboardButton("✏️ Edit Name", callback_data="profile:editname"), InlineKeyboardButton("💼 Edit Occupation", callback_data="profile:editoccupation")],
+        [InlineKeyboardButton("🎓 Get My Certificate", callback_data="profile:certificate")],
+        [InlineKeyboardButton("⬅ Main Menu", callback_data="menu:home")],
+    ])
+    await ctx.bot.send_message(
+        uid,
+        "MY PROFILE & DOCUMENTS\n\n"
+        f"Name: {s['name']}\n"
+        f"Occupation / Role: {s.get('occupation') or 'Not set'}\n"
+        f"Student ID: {s['student_no']}\n\n"
+        f"Name change: {name_edit}\n"
+        f"Occupation change: {occupation_edit}\n"
+        f"Certificate: {cert_status}\n\n"
+        "Your ID card can be re-downloaded anytime. Name and occupation can each be changed only once by the student. Admins can still correct genuine mistakes manually.",
+        reply_markup=kb,
+    )
+
+
+async def account_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    uid = q.from_user.id
+    await q.answer()
+    data = q.data
+
+    if data == "recover:start":
+        if get_student(uid):
+            await q.message.reply_text("This Telegram account is already linked to a student record.")
+            return
+        ctx.user_data.clear()
+        ctx.user_data["awaiting_recovery_student_id"] = True
+        await q.message.reply_text(
+            "Enter your existing Student ID, for example HB-0041.\n\n"
+            "For your security, the next step will also ask for the phone number or email used during registration."
+        )
+        return
+
+    s = get_student(uid)
+    if not s:
+        await q.message.reply_text("Please register or recover your account first using /start.")
+        return
+
+    if data == "profile:id":
+        await send_student_id_card(ctx, uid)
+        return
+    if data == "profile:certificate":
+        await resend_issued_certificate(ctx, uid)
+        return
+    if data == "profile:editname":
+        if s.get("name_edit_used"):
+            await q.message.reply_text("You have already used your one student name change. Please contact an admin if a genuine correction is still needed.")
+            return
+        ctx.user_data["awaiting_profile_name"] = True
+        await q.message.reply_text("Type your corrected full name. This student self-service name change can only be used once.")
+        return
+    if data == "profile:editoccupation":
+        if s.get("occupation_edit_used"):
+            await q.message.reply_text("You have already used your one occupation/role change. Please contact an admin if a genuine correction is still needed.")
+            return
+        ctx.user_data["awaiting_profile_occupation"] = True
+        await q.message.reply_text("Type your corrected occupation, profession, business, or current role. This student self-service change can only be used once.")
+        return
 
 
 async def menu_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -785,6 +894,8 @@ async def menu_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await q.message.reply_text("Help & FAQs — choose a category:", reply_markup=InlineKeyboardMarkup(kb)); return
     if data == "menu:rules":
         await send_rules_page(ctx, uid, 0); return
+    if data == "menu:profile":
+        await show_profile(ctx, uid); return
     if data == "menu:classes":
         if not rules_accepted(uid):
             await send_rules_page(ctx, uid, 0); return
@@ -815,7 +926,9 @@ async def menu_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if data == "menu:cert":
         s=get_student(uid)
         if not s: await q.message.reply_text("Please register first with /start."); return
-        await q.message.reply_text("Certification requires the final project and at least four assignments. Use My Progress to check recorded submissions."); return
+        if s.get("certificate_issued_at") and s.get("certificate_number"):
+            await q.message.reply_text("Your certificate has already been issued. You can re-download it anytime from My Profile & Documents.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🎓 Get My Certificate", callback_data="profile:certificate")],[InlineKeyboardButton("Main menu", callback_data="menu:home")]])); return
+        await q.message.reply_text("Your certificate has not been issued yet. Certification requires the final project and at least four assignments, followed by Academy verification."); return
     if data == "menu:status":
         s=get_student(uid)
         if not s:
@@ -859,7 +972,83 @@ async def deliver_class_access(ctx, uid):
 async def student_private_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     msg = update.effective_message
     uid = update.effective_user.id
-    if uid in ADMIN_IDS or not get_student(uid):
+
+    # Recovery must work before this Telegram account is linked to a student.
+    if ctx.user_data.get("awaiting_recovery_student_id"):
+        student_no = (msg.text or "").strip().upper()
+        s = get_student_by_no(student_no)
+        if not s:
+            await msg.reply_text("I couldn't find that Student ID. Check it and try again, for example HB-0041.")
+            return
+        ctx.user_data.pop("awaiting_recovery_student_id", None)
+        ctx.user_data["recovery_old_uid"] = s["user_id"]
+        ctx.user_data["recovery_student_no"] = s["student_no"]
+        ctx.user_data["awaiting_recovery_contact"] = True
+        await msg.reply_text("Now enter the email address OR phone number you used when you registered.")
+        return
+
+    if ctx.user_data.get("awaiting_recovery_contact"):
+        old_uid = ctx.user_data.get("recovery_old_uid")
+        with db() as c:
+            s = c.execute("SELECT * FROM students WHERE user_id=?", (old_uid,)).fetchone()
+        supplied = (msg.text or "").strip()
+        email_match = supplied.lower() == (s.get("email") or "").strip().lower() if s else False
+        phone_match = _clean_phone(supplied) == _clean_phone(s.get("phone")) if s and _clean_phone(supplied) else False
+        if not s or not (email_match or phone_match):
+            await msg.reply_text("Those details don't match the registration record. Please try the registered email or phone number, or contact an admin.")
+            return
+        if get_student(uid):
+            await msg.reply_text("This Telegram account is already linked to another student record. Please contact an admin.")
+            ctx.user_data.clear()
+            return
+        # Foreign keys are configured with ON UPDATE CASCADE by the profile migration.
+        with db() as c:
+            c.execute("UPDATE students SET user_id=?, username=? WHERE user_id=?", (uid, update.effective_user.username, old_uid))
+            c.execute("UPDATE moderation_reports SET user_id=? WHERE user_id=?", (uid, old_uid))
+        ctx.user_data.clear()
+        await msg.reply_text(f"✅ Account recovered successfully. Student ID {s['student_no']} is now linked to this Telegram account.")
+        if rules_accepted(uid):
+            await send_student_menu(ctx, uid, f"Welcome back, {s['name']}!")
+        else:
+            await send_rules_page(ctx, uid, 0)
+        return
+
+    if uid in ADMIN_IDS:
+        return
+    s = get_student(uid)
+    if not s:
+        return
+
+    if ctx.user_data.get("awaiting_profile_name"):
+        new_name = (msg.text or "").strip()[:80]
+        if len(new_name) < 2:
+            await msg.reply_text("Please enter a valid full name.")
+            return
+        if s.get("name_edit_used"):
+            ctx.user_data.pop("awaiting_profile_name", None)
+            await msg.reply_text("Your one self-service name change has already been used.")
+            return
+        with db() as c:
+            c.execute("UPDATE students SET name=?, name_edit_used=TRUE WHERE user_id=?", (new_name, uid))
+        ctx.user_data.pop("awaiting_profile_name", None)
+        await msg.reply_text("✅ Your name has been updated. Your ID card will now use the new name.")
+        await show_profile(ctx, uid)
+        return
+
+    if ctx.user_data.get("awaiting_profile_occupation"):
+        new_role = (msg.text or "").strip()[:120]
+        if len(new_role) < 2:
+            await msg.reply_text("Please enter a valid occupation or current role.")
+            return
+        if s.get("occupation_edit_used"):
+            ctx.user_data.pop("awaiting_profile_occupation", None)
+            await msg.reply_text("Your one self-service occupation change has already been used.")
+            return
+        with db() as c:
+            c.execute("UPDATE students SET occupation=?, occupation_edit_used=TRUE WHERE user_id=?", (new_role, uid))
+        ctx.user_data.pop("awaiting_profile_occupation", None)
+        await msg.reply_text("✅ Your occupation/role has been updated. Your ID card will now use the new role.")
+        await show_profile(ctx, uid)
         return
     if ctx.user_data.get("awaiting_support"):
         text = (msg.text or msg.caption or "[attachment]")[:3500]
@@ -1273,7 +1462,7 @@ async def daily_reminders(ctx: ContextTypes.DEFAULT_TYPE):
 def build_telegram_application():
     app = Application.builder().token(BOT_TOKEN).build()
     form = ConversationHandler(
-        entry_points=[CommandHandler("start", start)],
+        entry_points=[CommandHandler("start", start), CallbackQueryHandler(begin_registration, pattern=r"^register:new$")],
         states={
             NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, got_name)],
             AGE: [MessageHandler(filters.TEXT & ~filters.COMMAND, got_age)],
@@ -1297,6 +1486,7 @@ def build_telegram_application():
     app.add_handler(CommandHandler("certificate", certificate_cmd))
     app.add_handler(CommandHandler("status", status_cmd))
     app.add_handler(CommandHandler("help", help_cmd))
+    app.add_handler(CallbackQueryHandler(account_callback, pattern=r"^(profile:|recover:).+"))
     app.add_handler(CallbackQueryHandler(menu_callback, pattern=r"^(menu:|rules:|faq:|faqanswer:|assignment:).+"))
     app.add_handler(CallbackQueryHandler(admin_dashboard_callback, pattern=r"^admin:"))
     app.add_handler(CallbackQueryHandler(review_open_callback, pattern=r"^reviewopen:\d+$"))
