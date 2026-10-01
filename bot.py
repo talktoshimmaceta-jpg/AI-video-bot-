@@ -54,9 +54,17 @@ WEBHOOK_URL = os.getenv("WEBHOOK_URL", "").rstrip("/")
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "")
 CURRICULUM_FILE = os.getenv("CURRICULUM_FILE", "curriculum.pdf")
 LOGO_FILE = os.getenv("LOGO_FILE", "logo.png")
-WHATSAPP_LINK = os.getenv("WHATSAPP_LINK", "")  # legacy name kept for backwards compatibility
-CRASH_COURSE_LINK = os.getenv("CRASH_COURSE_LINK", WHATSAPP_LINK)
-PAID_CLASS_LINK = os.getenv("PAID_CLASS_LINK", os.getenv("CLASS_LINK_2", "") or os.getenv("CLASS_LINK", ""))
+# Registration/crash-course group. WHATSAPP_LINK is the primary Render key.
+WHATSAPP_LINK = os.getenv("WHATSAPP_LINK", "").strip()
+CRASH_COURSE_LINK = WHATSAPP_LINK or os.getenv("CRASH_COURSE_LINK", "").strip()
+
+# Separate main class for students whose payment has been approved.
+# Use PAID_CLASS_LINK in Render. Legacy CLASS_LINK_2 / CLASS_LINK remain as fallbacks.
+PAID_CLASS_LINK = (
+    os.getenv("PAID_CLASS_LINK", "").strip()
+    or os.getenv("CLASS_LINK_2", "").strip()
+    or os.getenv("CLASS_LINK", "").strip()
+)
 BOT_USERNAME = os.getenv("BOT_USERNAME", "")
 REFERRAL_BONUS_THRESHOLD = int(os.getenv("REFERRAL_BONUS_THRESHOLD", "3"))
 REFERRAL_FREE_ACCESS_CAP = int(os.getenv("REFERRAL_FREE_ACCESS_CAP", "20"))
@@ -605,6 +613,11 @@ async def status_cmd(update, ctx):
     if not s:
         await update.message.reply_text("You're not registered yet. Send /start.")
         return
+    if s.get("free_access"):
+        await update.message.reply_text(
+            f"Student ID: {s['student_no']}\nAccess: Complimentary paid-class access granted\nRecorded payment: ₦{int(s['paid_amount'] or 0):,}."
+        )
+        return
     await update.message.reply_text(
         f"Student ID: {s['student_no']}\nStatus: {s['status']}\nPaid: ₦{s['paid_amount']:,} of ₦{PRICE_FULL:,}\nBalance: ₦{max(PRICE_FULL - s['paid_amount'], 0):,}\n\n{BANK_DETAILS}\n\nUse Payment & Status in the menu to submit your receipt."
     )
@@ -904,8 +917,9 @@ async def menu_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         with db() as c:
             c.execute("UPDATE students SET rules_accepted_at=?, rules_version=? WHERE user_id=?", (now().isoformat(), RULES_VERSION, uid))
         await q.message.reply_text("Thank you. Your acceptance has been recorded.")
+        # Registration gives the student their ID, curriculum and free crash-course link.
+        # Do not prompt for payment here; the Academy will announce when payment opens.
         await send_registration_pack(ctx, uid)
-        await deliver_class_access(ctx, uid)
         await send_student_menu(ctx, uid)
         return
     if data.startswith("faq:"):
@@ -967,6 +981,13 @@ async def menu_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if not s:
             await q.message.reply_text("Please register first with /start."); return
         paid = int(s["paid_amount"] or 0)
+        if s.get("free_access"):
+            await q.message.reply_text(
+                f"PAYMENT & STATUS\n\nStudent ID: {s['student_no']}\nAccess status: Complimentary paid-class access granted\n"
+                f"Recorded payment: ₦{paid:,}\n\nYou do not need to make a payment for class access.",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Open My Classes", callback_data="menu:classes")],[InlineKeyboardButton("Main menu", callback_data="menu:home")]])
+            )
+            return
         balance = max(PRICE_FULL - paid, 0)
         status_label = {"registered": "Not paid", "part_paid": "Part payment received", "paid": "Fully paid"}.get(s["status"], s["status"])
         pay_kb = []
@@ -990,8 +1011,19 @@ async def deliver_class_access(ctx, uid):
         await ctx.bot.send_message(uid, "Please register first using /start."); return
     if not rules_accepted(uid):
         await send_rules_page(ctx, uid, 0); return
-    if s["status"] != "paid" and not s["bonus_sent"]:
-        await ctx.bot.send_message(uid, "Your class access is not yet unlocked. Please complete payment or check your status using /status."); return
+    if s["status"] != "paid" and not s["bonus_sent"] and not s.get("free_access"):
+        # Before payment, My Classes should simply take students back to the free
+        # crash-course group. Payment instructions are shown only when they
+        # deliberately open Payment & Status / the payment flow.
+        if CRASH_COURSE_LINK:
+            await ctx.bot.send_message(
+                uid,
+                "🚀 FREE CRASH COURSE\n\nYour current class access is the free crash-course group.",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Join Crash Course", url=CRASH_COURSE_LINK)]])
+            )
+        else:
+            await ctx.bot.send_message(uid, "Your crash-course group link is not configured yet. Please contact an Academy admin.")
+        return
     if PAID_CLASS_LINK:
         await ctx.bot.send_message(
             uid,
@@ -1044,6 +1076,37 @@ async def student_private_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE
             await send_student_menu(ctx, uid, f"Welcome back, {s['name']}!")
         else:
             await send_rules_page(ctx, uid, 0)
+        return
+
+    if uid in ADMIN_IDS and ctx.user_data.get("awaiting_free_access_student_id"):
+        student_no = (msg.text or "").strip().upper()
+        student = get_student_by_no(student_no)
+        if not student:
+            await msg.reply_text(
+                "I couldn't find that Student ID. Please check it and send it again, for example HB-0007.\n\n"
+                "Send /admin if you want to leave this screen."
+            )
+            return
+        with db() as c:
+            c.execute("UPDATE students SET free_access=TRUE WHERE user_id=?", (student["user_id"],))
+        ctx.user_data.pop("awaiting_free_access_student_id", None)
+        await msg.reply_text(
+            f"✅ Complimentary paid-class access granted to {student['name']} ({student['student_no']}).\n"
+            f"Their recorded payment remains ₦{int(student.get('paid_amount') or 0):,}.",
+            reply_markup=admin_dashboard_keyboard(),
+        )
+        if PAID_CLASS_LINK:
+            try:
+                await ctx.bot.send_message(
+                    student["user_id"],
+                    "🎁 COMPLIMENTARY ACCESS GRANTED\n\nYou've been granted free access to the main paid class by Heribhee Studio.",
+                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Join Paid Class", url=PAID_CLASS_LINK)]])
+                )
+            except Exception as e:
+                log.warning("Could not send complimentary access link to %s: %s", student["user_id"], e)
+                await msg.reply_text("Access was recorded, but Telegram could not deliver the class link. The student can open My Classes to retrieve it.")
+        else:
+            await msg.reply_text("Access was recorded, but PAID_CLASS_LINK is not configured in Render yet.")
         return
 
     if uid in ADMIN_IDS:
@@ -1216,7 +1279,7 @@ def admin_dashboard_keyboard():
         [InlineKeyboardButton("🎓 Certificates", callback_data="admin:certs"), InlineKeyboardButton("👥 Referrals", callback_data="admin:referrals")],
         [InlineKeyboardButton("💬 Support questions", callback_data="admin:support:0"), InlineKeyboardButton("📢 Message students", callback_data="admin:message")],
         [InlineKeyboardButton("📊 Statistics", callback_data="admin:stats"), InlineKeyboardButton("📁 Export records", callback_data="admin:export")],
-        [InlineKeyboardButton("🆔 Show my Telegram ID", callback_data="admin:myid")],
+        [InlineKeyboardButton("🎁 Free Access", callback_data="admin:freeaccess"), InlineKeyboardButton("🆔 Show my Telegram ID", callback_data="admin:myid")],
     ])
 
 
@@ -1235,14 +1298,23 @@ async def admin_dashboard_callback(update, ctx):
         await send_admin_dashboard(ctx,uid); return
     if data == "admin:myid":
         await q.message.reply_text(f"Your Telegram user ID: {uid}"); return
+    if data == "admin:freeaccess":
+        ctx.user_data["awaiting_free_access_student_id"] = True
+        await q.message.reply_text(
+            "🎁 GRANT FREE ACCESS\n\nSend the student's Heribhee Student ID, for example: HB-0007\n\n"
+            "The student will be given complimentary access to the paid class without changing their payment amount or revenue records.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Cancel", callback_data="admin:home")]])
+        )
+        return
     if data == "admin:stats":
         with db() as c:
             total=c.execute("SELECT COUNT(*) n FROM students").fetchone()["n"]
             paid=c.execute("SELECT COUNT(*) n FROM students WHERE status='paid'").fetchone()["n"]
+            free_access=c.execute("SELECT COUNT(*) n FROM students WHERE COALESCE(free_access,FALSE)=TRUE").fetchone()["n"]
             revenue=c.execute("SELECT COALESCE(SUM(paid_amount),0) r FROM students").fetchone()["r"]
             subs=c.execute("SELECT COUNT(*) n FROM assignment_submissions").fetchone()["n"]
             pending=c.execute("SELECT COUNT(*) n FROM assignment_submissions WHERE review_status='pending'").fetchone()["n"]
-        await q.message.reply_text(f"ACADEMY SNAPSHOT\nStudents: {total}\nFully paid: {paid}\nConfirmed revenue: ₦{revenue:,}\nAssignment submissions: {subs}\nPending reviews: {pending}",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Admin dashboard",callback_data="admin:home")]])); return
+        await q.message.reply_text(f"ACADEMY SNAPSHOT\nStudents: {total}\nFully paid: {paid}\nComplimentary access: {free_access}\nConfirmed revenue: ₦{revenue:,}\nAssignment submissions: {subs}\nPending reviews: {pending}",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Admin dashboard",callback_data="admin:home")]])); return
     if data == "admin:export":
         with db() as c: rows=c.execute("SELECT * FROM students").fetchall()
         buf=io.StringIO(); w=csv.writer(buf)
@@ -1466,9 +1538,9 @@ async def broadcast(update, ctx):
     audience, text = ctx.args[0], " ".join(ctx.args[1:])
     query = "SELECT user_id FROM students"
     if audience == "unpaid":
-        query += " WHERE status IN ('registered','part_paid')"
+        query += " WHERE status IN ('registered','part_paid') AND COALESCE(free_access,FALSE)=FALSE"
     elif audience == "paid":
-        query += " WHERE status='paid'"
+        query += " WHERE status='paid' OR COALESCE(free_access,FALSE)=TRUE"
     with db() as c:
         ids = [r["user_id"] for r in c.execute(query).fetchall()]
     sent = 0
@@ -1486,7 +1558,7 @@ async def broadcast(update, ctx):
 async def daily_reminders(ctx: ContextTypes.DEFAULT_TYPE):
     t = now()
     with db() as c:
-        rows = c.execute("SELECT * FROM students WHERE status IN ('registered','part_paid')").fetchall()
+        rows = c.execute("SELECT * FROM students WHERE status IN ('registered','part_paid') AND COALESCE(free_access,FALSE)=FALSE").fetchall()
         for s in rows:
             last = datetime.fromisoformat(s["last_reminded"]) if s["last_reminded"] else None
             if last and (t - last) < timedelta(days=2):
