@@ -401,17 +401,24 @@ async def maybe_send_referral_bonus(ctx, referrer_no):
 async def send_curriculum_to(ctx, uid):
     if not os.path.exists(CURRICULUM_FILE):
         log.warning("Curriculum file not found at %s", CURRICULUM_FILE)
-        return
+        await ctx.bot.send_message(
+            uid,
+            "The curriculum file is temporarily unavailable. Please contact an Academy admin."
+        )
+        return False
     try:
         with open(CURRICULUM_FILE, "rb") as f:
             await ctx.bot.send_document(
                 uid,
                 f,
-                filename="Curriculum.pdf",
-                caption="📄 Your training curriculum — take a look and see everything you'll be learning.",
+                filename="Heribhee_AI_Video_Making_Curriculum.pdf",
+                caption="📄 Your official Heribhee AI Video & Movie Making Training curriculum.",
             )
+        return True
     except Exception as e:
         log.warning("Could not send curriculum: %s", e)
+        await ctx.bot.send_message(uid, "Sorry, I couldn't send the curriculum just now. Please try again shortly.")
+        return False
 
 
 async def curriculum_cmd(update, ctx):
@@ -817,7 +824,7 @@ async def show_profile(ctx, uid):
     occupation_edit = "Used" if s.get("occupation_edit_used") else "Available once"
     cert_status = "Issued — available for re-download" if s.get("certificate_issued_at") and s.get("certificate_number") else "Not issued yet"
     kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton("🪪 Get My ID Card", callback_data="profile:id")],
+        [InlineKeyboardButton("🪪 Get My ID Card", callback_data="profile:id"), InlineKeyboardButton("📄 Get Curriculum", callback_data="profile:curriculum")],
         [InlineKeyboardButton("✏️ Edit Name", callback_data="profile:editname"), InlineKeyboardButton("💼 Edit Occupation", callback_data="profile:editoccupation")],
         [InlineKeyboardButton("🎓 Get My Certificate", callback_data="profile:certificate")],
         [InlineKeyboardButton("⬅ Main Menu", callback_data="menu:home")],
@@ -861,6 +868,9 @@ async def account_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     if data == "profile:id":
         await send_student_id_card(ctx, uid)
+        return
+    if data == "profile:curriculum":
+        await send_curriculum_to(ctx, uid)
         return
     if data == "profile:certificate":
         await resend_issued_certificate(ctx, uid)
@@ -1413,15 +1423,31 @@ async def complete_cmd(update, ctx):
         )
         return
     uid = s["user_id"]
-    with db() as c:
+
+    # Certificates are permanent documents. Re-running /complete must never
+    # replace the original issue date or certificate number.
+    existing_issued_at = s.get("certificate_issued_at")
+    existing_cert_no = s.get("certificate_number")
+    if existing_issued_at and existing_cert_no:
+        issued_at = existing_issued_at
+        cert_no = existing_cert_no
+        with db() as c:
+            c.execute(
+                "UPDATE students SET status='completed', certificate_eligible=TRUE WHERE user_id=?",
+                (uid,),
+            )
+    else:
         issued_at = now().isoformat()
         cert_no = f"HB-CERT-{s['student_no'].replace('HB-','')}"
-        c.execute(
-            "UPDATE students SET status='completed', completed_at=?, certificate_eligible=TRUE, certificate_issued_at=?, certificate_number=? WHERE user_id=?",
-            (issued_at, issued_at, cert_no, uid),
-        )
+        with db() as c:
+            c.execute(
+                "UPDATE students SET status='completed', completed_at=COALESCE(completed_at, ?), certificate_eligible=TRUE, certificate_issued_at=?, certificate_number=? WHERE user_id=?",
+                (issued_at, issued_at, cert_no, uid),
+            )
+
+    issue_date = datetime.fromisoformat(issued_at).strftime("%d %b %Y")
     try:
-        cert = cards.generate_certificate(s["name"], PROGRAM, now().strftime("%d %b %Y"), cert_no)
+        cert = cards.generate_certificate(s["name"], PROGRAM, issue_date, cert_no)
         await ctx.bot.send_photo(
             uid, cert,
             caption=f"🎓 Congratulations — you've completed the program! Certificate No: {cert_no}"
@@ -1554,6 +1580,18 @@ async def lifespan(_app: FastAPI):
     # Establish the pool once when Render starts the service.
     DB_POOL.open(wait=True, timeout=20)
     init_db()
+
+    missing_card_assets = cards.validate_assets()
+    if missing_card_assets:
+        log.error("Missing card/certificate assets: %s", ", ".join(missing_card_assets))
+    else:
+        log.info("Certificate and student-card templates verified")
+
+    if not os.path.exists(CURRICULUM_FILE):
+        log.warning("Curriculum file not found at startup: %s", CURRICULUM_FILE)
+    else:
+        log.info("Curriculum file verified: %s", CURRICULUM_FILE)
+
     await telegram_app.initialize()
     await telegram_app.start()
 
