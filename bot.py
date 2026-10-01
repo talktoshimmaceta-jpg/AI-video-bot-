@@ -7,6 +7,7 @@ from contextlib import asynccontextmanager
 
 import psycopg
 from psycopg.rows import dict_row
+from psycopg_pool import ConnectionPool
 from fastapi import FastAPI, HTTPException, Request
 from datetime import datetime, time, timedelta
 from zoneinfo import ZoneInfo
@@ -61,6 +62,22 @@ REFERRAL_BONUS_THRESHOLD = int(os.getenv("REFERRAL_BONUS_THRESHOLD", "3"))
 REFERRAL_FREE_ACCESS_CAP = int(os.getenv("REFERRAL_FREE_ACCESS_CAP", "20"))
 TZ = ZoneInfo("Africa/Lagos")
 
+# Reuse a small set of PostgreSQL connections instead of opening a fresh
+# network connection for every Telegram button press. This is especially
+# important on free hosting, where repeated TLS/database handshakes can make
+# inline buttons feel stuck.
+DB_POOL_MIN = max(1, int(os.getenv("DB_POOL_MIN", "1")))
+DB_POOL_MAX = max(DB_POOL_MIN, int(os.getenv("DB_POOL_MAX", "5")))
+DB_POOL_TIMEOUT = float(os.getenv("DB_POOL_TIMEOUT", "10"))
+DB_POOL = ConnectionPool(
+    conninfo=DATABASE_URL,
+    min_size=DB_POOL_MIN,
+    max_size=DB_POOL_MAX,
+    timeout=DB_POOL_TIMEOUT,
+    kwargs={"row_factory": dict_row, "connect_timeout": 10},
+    open=False,
+)
+
 NAME, AGE, PHONE, EMAIL, FOUND_US, GOAL, OCCUPATION, MOTIVATION, CATEGORY = range(9)
 CATEGORIES = ["Student", "Business owner", "Knowledge seeker", "Income seeker"]
 
@@ -92,16 +109,22 @@ class DatabaseConnection:
         self.conn = None
 
     def __enter__(self):
-        self.conn = psycopg.connect(DATABASE_URL, row_factory=dict_row)
+        # Borrow an already-open connection from the shared pool.
+        self.conn = DB_POOL.getconn(timeout=DB_POOL_TIMEOUT)
         return self
 
     def __exit__(self, exc_type, exc, tb):
         if self.conn is not None:
-            if exc_type is None:
-                self.conn.commit()
-            else:
-                self.conn.rollback()
-            self.conn.close()
+            try:
+                if exc_type is None:
+                    self.conn.commit()
+                else:
+                    self.conn.rollback()
+            finally:
+                # Return the connection to the pool instead of closing the TCP/TLS
+                # connection and forcing the next button press to reconnect.
+                DB_POOL.putconn(self.conn)
+                self.conn = None
         return False
 
     def execute(self, query, params=None):
@@ -1459,6 +1482,20 @@ async def daily_reminders(ctx: ContextTypes.DEFAULT_TYPE):
             await asyncio.sleep(0.05)
 
 
+async def telegram_error_handler(update: object, ctx: ContextTypes.DEFAULT_TYPE):
+    """Log full callback/handler failures and stop buttons from failing silently."""
+    log.error("Unhandled Telegram update error", exc_info=ctx.error)
+    try:
+        if isinstance(update, Update) and update.callback_query:
+            await update.callback_query.answer(
+                "Something went wrong while processing that action. Please try again.",
+                show_alert=True,
+            )
+    except Exception:
+        # Never let the error-notification path hide the original exception.
+        pass
+
+
 def build_telegram_application():
     app = Application.builder().token(BOT_TOKEN).build()
     form = ConversationHandler(
@@ -1505,6 +1542,7 @@ def build_telegram_application():
     app.add_handler(CallbackQueryHandler(choose_plan, pattern=r"^plan:(full|two)$"))
     app.add_handler(MessageHandler((filters.PHOTO | filters.Document.ALL) & filters.ChatType.PRIVATE, got_proof))
     app.job_queue.run_daily(daily_reminders, time=time(9, 0, tzinfo=TZ))
+    app.add_error_handler(telegram_error_handler)
     return app
 
 
@@ -1513,6 +1551,8 @@ telegram_app = build_telegram_application()
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
+    # Establish the pool once when Render starts the service.
+    DB_POOL.open(wait=True, timeout=20)
     init_db()
     await telegram_app.initialize()
     await telegram_app.start()
@@ -1532,6 +1572,7 @@ async def lifespan(_app: FastAPI):
 
     await telegram_app.stop()
     await telegram_app.shutdown()
+    DB_POOL.close()
 
 
 web = FastAPI(title="Heribhee Academy Bot", lifespan=lifespan)
