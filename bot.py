@@ -3,6 +3,7 @@ import csv
 import io
 import logging
 import os
+from html import escape
 from contextlib import asynccontextmanager
 
 import psycopg
@@ -11,6 +12,13 @@ from psycopg_pool import ConnectionPool
 from fastapi import FastAPI, HTTPException, Request
 from datetime import datetime, time, timedelta
 from zoneinfo import ZoneInfo
+
+from reportlab.lib import colors
+from reportlab.lib.enums import TA_CENTER
+from reportlab.lib.pagesizes import A4, landscape
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.lib.units import mm
+from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer, Image as RLImage, PageBreak
 
 from dotenv import load_dotenv
 from telegram import (
@@ -69,6 +77,54 @@ BOT_USERNAME = os.getenv("BOT_USERNAME", "")
 REFERRAL_BONUS_THRESHOLD = int(os.getenv("REFERRAL_BONUS_THRESHOLD", "3"))
 REFERRAL_FREE_ACCESS_CAP = int(os.getenv("REFERRAL_FREE_ACCESS_CAP", "20"))
 TZ = ZoneInfo("Africa/Lagos")
+
+# Class-group automation. Times are Lagos/Nigeria time and can be changed in Render.
+GROUP_MORNING_TIME = os.getenv("GROUP_MORNING_TIME", "08:00").strip()
+GROUP_REMINDER_TIME = os.getenv("GROUP_REMINDER_TIME", "17:00").strip()
+GROUP_MESSAGES_DEFAULT_ENABLED = os.getenv("GROUP_MESSAGES_ENABLED", "true").strip().lower() not in {"0", "false", "no", "off"}
+
+GROUP_MESSAGE_PACK = {
+    "morning": {
+        0: [
+            "Good morning, everyone ☀️ Welcome to a new learning week. Stay curious, practise what you learn, and ask questions whenever you get stuck.",
+            "Good morning, class 🎬 New week, fresh energy. Focus on understanding the process, not just finishing quickly. Small practice today will make the next task easier.",
+            "Happy Monday, everyone 🌟 This week, aim to create, test, improve, and repeat. Progress comes from actually using the tools, not only watching the lessons.",
+        ],
+        1: [
+            "Good morning, class 👋 Keep building on what you learned yesterday. If something did not work the first time, adjust it and try again.",
+            "Good morning ☀️ Today is another chance to practise. Save your best prompts, note what works, and keep improving your workflow.",
+            "Morning, everyone 🎥 Remember: good AI video work comes from clear ideas, clear prompts, and patient refinement. Keep practising.",
+        ],
+        3: [
+            "Good morning, class 🌤️ We are back at it today. Review your previous work, correct weak areas, and try one new technique before the day ends.",
+            "Good morning 👋 Thursday is a good day to check your progress. Do not wait until the weekend to fix something you already know needs attention.",
+            "Morning, creators 🎬 Keep your work simple and intentional today. One well-made piece is more useful than several rushed attempts.",
+        ],
+        4: [
+            "Good morning, everyone 🎉 It is Friday. Finish the week strong, organise your files, complete your practice, and note what you want to improve next week.",
+            "Happy Friday, class 🌟 Take a moment to look at how much you have learned this week. Finish your outstanding practice and keep your best work saved.",
+            "Good morning ☀️ Friday is for finishing well. Review your work, make corrections, and keep practising the skills you want to become confident in.",
+        ],
+    },
+    "reminder": {
+        0: [
+            "📌 Monday reminder: your Monday task is due Tuesday by 6 PM. Start early so you have enough time to test, correct, and submit properly.",
+            "📝 Assignment reminder: do not leave the Monday task until the last minute. Submission deadline is Tuesday, 6 PM Nigeria time.",
+        ],
+        1: [
+            "📌 Tuesday reminder: your Tuesday task is due Thursday by 6 PM. Use the time to practise and submit a clean final attempt.",
+            "📝 Keep your Tuesday task moving. Deadline is Thursday at 6 PM Nigeria time. If you are stuck, ask for help early.",
+        ],
+        3: [
+            "📌 Thursday reminder: today’s task is due Friday by 5 PM. Check your work carefully before submitting it through the bot.",
+            "📝 Thursday task reminder: deadline is Friday, 5 PM Nigeria time. Complete it early enough to review your result before submission.",
+        ],
+        4: [
+            "📌 Friday milestone reminder: your weekly milestone is due Sunday by 11:59 PM. Use the weekend wisely and submit through the bot before the deadline.",
+            "📝 Weekly milestone: deadline is Sunday, 11:59 PM Nigeria time. Build it carefully, review it, and submit before the cutoff.",
+        ],
+    },
+}
 
 # Reuse a small set of PostgreSQL connections instead of opening a fresh
 # network connection for every Telegram button press. This is especially
@@ -169,6 +225,50 @@ def get_student_by_no(student_no):
 
 def now():
     return datetime.now(TZ)
+
+
+def _parse_hhmm(value, fallback):
+    try:
+        hour_s, minute_s = value.split(":", 1)
+        return time(int(hour_s), int(minute_s), tzinfo=TZ)
+    except Exception:
+        log.warning("Invalid schedule time %r. Falling back to %s", value, fallback)
+        hour_s, minute_s = fallback.split(":", 1)
+        return time(int(hour_s), int(minute_s), tzinfo=TZ)
+
+
+def get_app_setting(key, default=None):
+    try:
+        with db() as c:
+            row = c.execute("SELECT value FROM app_settings WHERE key=?", (key,)).fetchone()
+        return row["value"] if row else default
+    except Exception:
+        return default
+
+
+def set_app_setting(key, value):
+    with db() as c:
+        c.execute(
+            "INSERT INTO app_settings(key,value,updated_at) VALUES(?,?,NOW()) "
+            "ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value, updated_at=NOW()",
+            (key, str(value)),
+        )
+
+
+def group_messages_enabled():
+    default = "true" if GROUP_MESSAGES_DEFAULT_ENABLED else "false"
+    return str(get_app_setting("group_messages_enabled", default)).lower() in {"1", "true", "yes", "on"}
+
+
+def _message_for(kind, dt=None):
+    dt = dt or now()
+    weekday = dt.weekday()
+    options = GROUP_MESSAGE_PACK.get(kind, {}).get(weekday, [])
+    if not options:
+        return None
+    # Deterministic weekly rotation: changes each week but remains predictable.
+    index = dt.isocalendar().week % len(options)
+    return options[index]
 
 
 def referral_count(student_no):
@@ -1078,6 +1178,19 @@ async def student_private_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE
             await send_rules_page(ctx, uid, 0)
         return
 
+    if uid in ADMIN_IDS and ctx.user_data.get("awaiting_class_group_message"):
+        custom_text = (msg.text or msg.caption or "").strip()
+        if not custom_text:
+            await msg.reply_text("Please send a text message, or send /admin to cancel.")
+            return
+        try:
+            await send_class_group_message(ctx, custom_text[:4000])
+            ctx.user_data.pop("awaiting_class_group_message", None)
+            await msg.reply_text("✅ Custom message sent to the class group.", reply_markup=admin_dashboard_keyboard())
+        except Exception as e:
+            await msg.reply_text(f"Could not send to the class group: {e}")
+        return
+
     if uid in ADMIN_IDS and ctx.user_data.get("awaiting_free_access_student_id"):
         student_no = (msg.text or "").strip().upper()
         student = get_student_by_no(student_no)
@@ -1271,6 +1384,121 @@ async def support_decision(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await q.edit_message_text((q.message.text or "")+f"\n\nHandled by {q.from_user.full_name}")
 
 
+# ---------- PDF student-record export ----------
+def build_student_records_pdf(rows):
+    buf = io.BytesIO()
+    buf.name = f"Heribhee_Student_Records_{now().strftime('%Y-%m-%d')}.pdf"
+    doc = SimpleDocTemplate(
+        buf,
+        pagesize=landscape(A4),
+        rightMargin=10*mm, leftMargin=10*mm, topMargin=10*mm, bottomMargin=10*mm,
+        title="Heribhee Studio Student Records",
+        author="Heribhee Studio",
+    )
+    styles = getSampleStyleSheet()
+    title_style = ParagraphStyle(
+        "HeribheeTitle", parent=styles["Title"], alignment=TA_CENTER,
+        fontSize=17, leading=20, textColor=colors.HexColor("#12213D"), spaceAfter=4*mm,
+    )
+    small = ParagraphStyle("Small", parent=styles["BodyText"], fontSize=7.3, leading=8.5)
+    meta = ParagraphStyle("Meta", parent=styles["BodyText"], fontSize=8.5, leading=10, alignment=TA_CENTER, textColor=colors.HexColor("#555555"))
+
+    story = []
+    if os.path.exists("logo_shield.png"):
+        try:
+            story.append(RLImage("logo_shield.png", width=15*mm, height=15*mm))
+        except Exception:
+            pass
+    story.append(Paragraph("HERIBHEE STUDIO - STUDENT RECORDS", title_style))
+    free_count = sum(1 for r in rows if r.get("free_access"))
+    paid_count = sum(1 for r in rows if r.get("status") == "paid")
+    revenue = sum(int(r.get("paid_amount") or 0) for r in rows)
+    story.append(Paragraph(
+        f"Generated {now().strftime('%d %b %Y, %I:%M %p')} (Nigeria time) &nbsp;&nbsp;|&nbsp;&nbsp; "
+        f"Students: {len(rows)} &nbsp;&nbsp;|&nbsp;&nbsp; Fully paid: {paid_count} &nbsp;&nbsp;|&nbsp;&nbsp; "
+        f"Free access: {free_count} &nbsp;&nbsp;|&nbsp;&nbsp; Confirmed revenue: ₦{revenue:,}",
+        meta,
+    ))
+    story.append(Spacer(1, 5*mm))
+
+    headers = ["Student ID", "Name", "Phone", "Email", "Occupation / Role", "Access", "Paid", "Registered", "Certificate"]
+    data = [[Paragraph(f"<b>{h}</b>", small) for h in headers]]
+    for r in rows:
+        if r.get("free_access"):
+            access = "Complimentary"
+        elif r.get("status") == "paid":
+            access = "Paid"
+        elif r.get("status") == "part_paid":
+            access = "Part paid"
+        else:
+            access = "Registered"
+        cert = r.get("certificate_number") or ("Eligible" if r.get("certificate_eligible") else "-")
+        reg = (r.get("registered_at") or "")[:10]
+        vals = [
+            r.get("student_no") or "-",
+            r.get("name") or "-",
+            r.get("phone") or "-",
+            r.get("email") or "-",
+            r.get("occupation") or r.get("category") or "-",
+            access,
+            f"₦{int(r.get('paid_amount') or 0):,}",
+            reg or "-",
+            cert,
+        ]
+        data.append([Paragraph(escape(str(v)), small) for v in vals])
+
+    widths = [20*mm, 34*mm, 28*mm, 45*mm, 39*mm, 25*mm, 20*mm, 22*mm, 27*mm]
+    table = Table(data, colWidths=widths, repeatRows=1, hAlign="CENTER")
+    table.setStyle(TableStyle([
+        ("BACKGROUND", (0,0), (-1,0), colors.HexColor("#12213D")),
+        ("TEXTCOLOR", (0,0), (-1,0), colors.white),
+        ("VALIGN", (0,0), (-1,-1), "TOP"),
+        ("GRID", (0,0), (-1,-1), 0.35, colors.HexColor("#C8CDD6")),
+        ("ROWBACKGROUNDS", (0,1), (-1,-1), [colors.white, colors.HexColor("#F5F2E9")]),
+        ("LEFTPADDING", (0,0), (-1,-1), 4),
+        ("RIGHTPADDING", (0,0), (-1,-1), 4),
+        ("TOPPADDING", (0,0), (-1,-1), 4),
+        ("BOTTOMPADDING", (0,0), (-1,-1), 4),
+    ]))
+    story.append(table)
+    doc.build(story)
+    buf.seek(0)
+    return buf
+
+
+# ---------- class group messaging ----------
+async def send_class_group_message(ctx, text):
+    if not CLASS_GROUP_ID:
+        raise RuntimeError("CLASS_GROUP_ID is not configured")
+    await ctx.bot.send_message(CLASS_GROUP_ID, text)
+
+
+async def scheduled_group_morning(ctx: ContextTypes.DEFAULT_TYPE):
+    if not group_messages_enabled() or not CLASS_GROUP_ID:
+        return
+    if now().weekday() not in {0, 1, 3, 4}:
+        return
+    text = _message_for("morning")
+    if text:
+        try:
+            await send_class_group_message(ctx, text)
+        except Exception as e:
+            log.warning("Could not send scheduled morning group message: %s", e)
+
+
+async def scheduled_group_reminder(ctx: ContextTypes.DEFAULT_TYPE):
+    if not group_messages_enabled() or not CLASS_GROUP_ID:
+        return
+    if now().weekday() not in {0, 1, 3, 4}:
+        return
+    text = _message_for("reminder")
+    if text:
+        try:
+            await send_class_group_message(ctx, text)
+        except Exception as e:
+            log.warning("Could not send scheduled class reminder: %s", e)
+
+
 # ---------- admin dashboard and assignment review ----------
 def admin_dashboard_keyboard():
     return InlineKeyboardMarkup([
@@ -1278,8 +1506,9 @@ def admin_dashboard_keyboard():
         [InlineKeyboardButton("📝 Assignments", callback_data="admin:assignments"), InlineKeyboardButton("✅ Pending reviews", callback_data="admin:pending:0")],
         [InlineKeyboardButton("🎓 Certificates", callback_data="admin:certs"), InlineKeyboardButton("👥 Referrals", callback_data="admin:referrals")],
         [InlineKeyboardButton("💬 Support questions", callback_data="admin:support:0"), InlineKeyboardButton("📢 Message students", callback_data="admin:message")],
-        [InlineKeyboardButton("📊 Statistics", callback_data="admin:stats"), InlineKeyboardButton("📁 Export records", callback_data="admin:export")],
-        [InlineKeyboardButton("🎁 Free Access", callback_data="admin:freeaccess"), InlineKeyboardButton("🆔 Show my Telegram ID", callback_data="admin:myid")],
+        [InlineKeyboardButton("📣 Group Messages", callback_data="admin:groupmsg"), InlineKeyboardButton("📄 Export PDF", callback_data="admin:export")],
+        [InlineKeyboardButton("📊 Statistics", callback_data="admin:stats"), InlineKeyboardButton("🎁 Free Access", callback_data="admin:freeaccess")],
+        [InlineKeyboardButton("🆔 Show my Telegram ID", callback_data="admin:myid")],
     ])
 
 
@@ -1316,13 +1545,80 @@ async def admin_dashboard_callback(update, ctx):
             pending=c.execute("SELECT COUNT(*) n FROM assignment_submissions WHERE review_status='pending'").fetchone()["n"]
         await q.message.reply_text(f"ACADEMY SNAPSHOT\nStudents: {total}\nFully paid: {paid}\nComplimentary access: {free_access}\nConfirmed revenue: ₦{revenue:,}\nAssignment submissions: {subs}\nPending reviews: {pending}",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Admin dashboard",callback_data="admin:home")]])); return
     if data == "admin:export":
-        with db() as c: rows=c.execute("SELECT * FROM students").fetchall()
-        buf=io.StringIO(); w=csv.writer(buf)
-        if rows:
-            w.writerow(rows[0].keys())
-            for r in rows: w.writerow(list(r))
-        out=io.BytesIO(buf.getvalue().encode()); out.name="students.csv"
-        await q.message.reply_document(out,caption="Student database export"); return
+        with db() as c:
+            rows=c.execute("SELECT * FROM students ORDER BY student_no").fetchall()
+        out=build_student_records_pdf(rows)
+        await q.message.reply_document(
+            out,
+            caption="📄 Heribhee Studio student records - clean PDF export",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Admin dashboard", callback_data="admin:home")]])
+        )
+        return
+    if data == "admin:groupmsg":
+        enabled = group_messages_enabled()
+        status = "ON ✅" if enabled else "OFF ⛔"
+        kb = [
+            [InlineKeyboardButton("Send Morning Message Now", callback_data="admin:groupmsg:morning")],
+            [InlineKeyboardButton("Send Assignment Reminder Now", callback_data="admin:groupmsg:reminder")],
+            [InlineKeyboardButton("Write Custom Class Message", callback_data="admin:groupmsg:custom")],
+            [InlineKeyboardButton("Test Class Group", callback_data="admin:groupmsg:testclass"), InlineKeyboardButton("Test Review Group", callback_data="admin:groupmsg:testreview")],
+            [InlineKeyboardButton(("Turn OFF" if enabled else "Turn ON") + " Auto Messages", callback_data="admin:groupmsg:toggle")],
+            [InlineKeyboardButton("Admin dashboard", callback_data="admin:home")],
+        ]
+        await q.message.reply_text(
+            f"📣 GROUP MESSAGES\n\nAutomatic messages: {status}\n"
+            f"Morning time: {GROUP_MORNING_TIME}\nReminder time: {GROUP_REMINDER_TIME}\n"
+            "Days: Monday, Tuesday, Thursday, Friday\n\n"
+            "No payment reminders are included in this message pack.",
+            reply_markup=InlineKeyboardMarkup(kb),
+        )
+        return
+    if data == "admin:groupmsg:toggle":
+        new_state = not group_messages_enabled()
+        set_app_setting("group_messages_enabled", "true" if new_state else "false")
+        await q.message.reply_text(f"Automatic class-group messages are now {'ON ✅' if new_state else 'OFF ⛔'}.")
+        await send_admin_dashboard(ctx, uid)
+        return
+    if data == "admin:groupmsg:morning":
+        text = _message_for("morning") or GROUP_MESSAGE_PACK["morning"][0][0]
+        try:
+            await send_class_group_message(ctx, text)
+            await q.message.reply_text("✅ Morning message sent to the class group.")
+        except Exception as e:
+            await q.message.reply_text(f"Could not send to the class group: {e}")
+        return
+    if data == "admin:groupmsg:reminder":
+        text = _message_for("reminder") or GROUP_MESSAGE_PACK["reminder"][0][0]
+        try:
+            await send_class_group_message(ctx, text)
+            await q.message.reply_text("✅ Assignment reminder sent to the class group.")
+        except Exception as e:
+            await q.message.reply_text(f"Could not send to the class group: {e}")
+        return
+    if data == "admin:groupmsg:custom":
+        ctx.user_data["awaiting_class_group_message"] = True
+        await q.message.reply_text("Type the message you want me to send to the class group. Send /admin to cancel.")
+        return
+    if data == "admin:groupmsg:testclass":
+        if not CLASS_GROUP_ID:
+            await q.message.reply_text("CLASS_GROUP_ID is not configured in Render.")
+        else:
+            try:
+                await ctx.bot.send_message(CLASS_GROUP_ID, "✅ Heribhee bot class-group connection test successful.")
+                await q.message.reply_text("✅ Test message sent to the class group.")
+            except Exception as e:
+                await q.message.reply_text(f"Class-group test failed: {e}")
+        return
+    if data == "admin:groupmsg:testreview":
+        if not ADMIN_GROUP_ID:
+            await q.message.reply_text("ADMIN_GROUP_ID is not configured in Render.")
+        else:
+            try:
+                await ctx.bot.send_message(ADMIN_GROUP_ID, "✅ Heribhee bot assignment-review group connection test successful.")
+                await q.message.reply_text("✅ Test message sent to the assignment-review group.")
+            except Exception as e:
+                await q.message.reply_text(f"Review-group test failed: {e}")
+        return
     if data.startswith("admin:payments:"):
         offset=int(data.rsplit(":",1)[1])
         with db() as c:
@@ -1531,6 +1827,14 @@ async def complete_cmd(update, ctx):
 
 
 @admin_only
+async def export_pdf(update, ctx):
+    with db() as c:
+        rows = c.execute("SELECT * FROM students ORDER BY student_no").fetchall()
+    out = build_student_records_pdf(rows)
+    await update.message.reply_document(out, caption="📄 Heribhee Studio student records - clean PDF export")
+
+
+@admin_only
 async def broadcast(update, ctx):
     if len(ctx.args) < 2 or ctx.args[0] not in ("all", "unpaid", "paid"):
         await update.message.reply_text("Usage: /broadcast <all|unpaid|paid> <message>")
@@ -1634,12 +1938,15 @@ def build_telegram_application():
     app.add_handler(CommandHandler("leaderboard", leaderboard_cmd))
     app.add_handler(CommandHandler("stats", stats))
     app.add_handler(CommandHandler("export", export))
+    app.add_handler(CommandHandler("exportpdf", export_pdf))
     app.add_handler(CommandHandler("complete", complete_cmd))
     app.add_handler(CommandHandler("broadcast", broadcast))
     app.add_handler(CallbackQueryHandler(review_payment, pattern=r"^(ap|rj):\d+$"))
     app.add_handler(CallbackQueryHandler(choose_plan, pattern=r"^plan:(full|two)$"))
     app.add_handler(MessageHandler((filters.PHOTO | filters.Document.ALL) & filters.ChatType.PRIVATE, got_proof))
     app.job_queue.run_daily(daily_reminders, time=time(9, 0, tzinfo=TZ))
+    app.job_queue.run_daily(scheduled_group_morning, time=_parse_hhmm(GROUP_MORNING_TIME, "08:00"))
+    app.job_queue.run_daily(scheduled_group_reminder, time=_parse_hhmm(GROUP_REMINDER_TIME, "17:00"))
     app.add_error_handler(telegram_error_handler)
     return app
 
