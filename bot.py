@@ -260,10 +260,44 @@ def group_messages_enabled():
     return str(get_app_setting("group_messages_enabled", default)).lower() in {"1", "true", "yes", "on"}
 
 
+WEEKDAY_NAMES = {0: "Monday", 1: "Tuesday", 3: "Thursday", 4: "Friday"}
+
+
+def get_group_pack(kind, weekday):
+    """Return admin-edited messages for a day, falling back to the built-in pack."""
+    try:
+        with db() as c:
+            rows = c.execute(
+                "SELECT message FROM group_message_pack WHERE kind=? AND weekday=? AND active=TRUE ORDER BY position,id",
+                (kind, weekday),
+            ).fetchall()
+        if rows:
+            return [r["message"] for r in rows]
+    except Exception as e:
+        log.warning("Could not read custom group message pack: %s", e)
+    return list(GROUP_MESSAGE_PACK.get(kind, {}).get(weekday, []))
+
+
+def save_group_pack(kind, weekday, messages):
+    """Replace one day/category message pack with the supplied messages."""
+    with db() as c:
+        c.execute("DELETE FROM group_message_pack WHERE kind=? AND weekday=?", (kind, weekday))
+        for pos, message in enumerate(messages):
+            c.execute(
+                "INSERT INTO group_message_pack(kind,weekday,position,message,active,updated_at) VALUES(?,?,?,?,TRUE,NOW())",
+                (kind, weekday, pos, message),
+            )
+
+
+def reset_group_pack(kind, weekday):
+    with db() as c:
+        c.execute("DELETE FROM group_message_pack WHERE kind=? AND weekday=?", (kind, weekday))
+
+
 def _message_for(kind, dt=None):
     dt = dt or now()
     weekday = dt.weekday()
-    options = GROUP_MESSAGE_PACK.get(kind, {}).get(weekday, [])
+    options = get_group_pack(kind, weekday)
     if not options:
         return None
     # Deterministic weekly rotation: changes each week but remains predictable.
@@ -1178,6 +1212,30 @@ async def student_private_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE
             await send_rules_page(ctx, uid, 0)
         return
 
+    if uid in ADMIN_IDS and ctx.user_data.get("awaiting_pack_message"):
+        state = ctx.user_data.get("pack_editor") or {}
+        kind = state.get("kind")
+        weekday = state.get("weekday")
+        mode = state.get("mode")
+        index = state.get("index")
+        new_text = (msg.text or msg.caption or "").strip()
+        if not new_text:
+            await msg.reply_text("Please send the message text, or send /admin to cancel.")
+            return
+        messages = get_group_pack(kind, weekday)
+        if mode == "edit" and isinstance(index, int) and 0 <= index < len(messages):
+            messages[index] = new_text[:4000]
+            action = "updated"
+        else:
+            messages.append(new_text[:4000])
+            action = "added"
+        save_group_pack(kind, weekday, messages)
+        ctx.user_data.pop("awaiting_pack_message", None)
+        ctx.user_data.pop("pack_editor", None)
+        await msg.reply_text(f"✅ Message {action} in the {WEEKDAY_NAMES.get(weekday, weekday)} {kind} pack.")
+        await send_admin_dashboard(ctx, uid)
+        return
+
     if uid in ADMIN_IDS and ctx.user_data.get("awaiting_class_group_message"):
         custom_text = (msg.text or msg.caption or "").strip()
         if not custom_text:
@@ -1560,6 +1618,7 @@ async def admin_dashboard_callback(update, ctx):
         kb = [
             [InlineKeyboardButton("Send Morning Message Now", callback_data="admin:groupmsg:morning")],
             [InlineKeyboardButton("Send Assignment Reminder Now", callback_data="admin:groupmsg:reminder")],
+            [InlineKeyboardButton("✏️ Edit Message Pack", callback_data="admin:groupmsg:edit")],
             [InlineKeyboardButton("Write Custom Class Message", callback_data="admin:groupmsg:custom")],
             [InlineKeyboardButton("Test Class Group", callback_data="admin:groupmsg:testclass"), InlineKeyboardButton("Test Review Group", callback_data="admin:groupmsg:testreview")],
             [InlineKeyboardButton(("Turn OFF" if enabled else "Turn ON") + " Auto Messages", callback_data="admin:groupmsg:toggle")],
@@ -1572,6 +1631,78 @@ async def admin_dashboard_callback(update, ctx):
             "No payment reminders are included in this message pack.",
             reply_markup=InlineKeyboardMarkup(kb),
         )
+        return
+    if data == "admin:groupmsg:edit":
+        kb = [
+            [InlineKeyboardButton("☀️ Morning Messages", callback_data="admin:pack:kind:morning")],
+            [InlineKeyboardButton("📝 Assignment Reminders", callback_data="admin:pack:kind:reminder")],
+            [InlineKeyboardButton("Back", callback_data="admin:groupmsg")],
+        ]
+        await q.message.reply_text(
+            "✏️ MESSAGE PACK EDITOR\n\nChoose which set of messages you want to edit.",
+            reply_markup=InlineKeyboardMarkup(kb),
+        )
+        return
+    if data.startswith("admin:pack:kind:"):
+        kind = data.rsplit(":", 1)[1]
+        label = "Morning" if kind == "morning" else "Assignment reminder"
+        kb = [[InlineKeyboardButton(WEEKDAY_NAMES[d], callback_data=f"admin:pack:day:{kind}:{d}")] for d in (0,1,3,4)]
+        kb.append([InlineKeyboardButton("Back", callback_data="admin:groupmsg:edit")])
+        await q.message.reply_text(f"{label} message pack\n\nChoose a day:", reply_markup=InlineKeyboardMarkup(kb))
+        return
+    if data.startswith("admin:pack:day:"):
+        _, _, _, kind, weekday_s = data.split(":")
+        weekday = int(weekday_s)
+        messages = get_group_pack(kind, weekday)
+        lines = [f"{i+1}. {m}" for i,m in enumerate(messages)] or ["No messages in this pack yet."]
+        kb = []
+        for i in range(len(messages)):
+            kb.append([
+                InlineKeyboardButton(f"Edit #{i+1}", callback_data=f"admin:pack:edit:{kind}:{weekday}:{i}"),
+                InlineKeyboardButton(f"Delete #{i+1}", callback_data=f"admin:pack:delete:{kind}:{weekday}:{i}"),
+            ])
+        kb.append([InlineKeyboardButton("➕ Add Message", callback_data=f"admin:pack:add:{kind}:{weekday}")])
+        kb.append([InlineKeyboardButton("↩ Reset to Defaults", callback_data=f"admin:pack:reset:{kind}:{weekday}")])
+        kb.append([InlineKeyboardButton("Back", callback_data=f"admin:pack:kind:{kind}")])
+        await q.message.reply_text(
+            f"{WEEKDAY_NAMES.get(weekday)} — {'Morning' if kind=='morning' else 'Assignment reminder'} messages\n\n" + "\n\n".join(lines),
+            reply_markup=InlineKeyboardMarkup(kb),
+        )
+        return
+    if data.startswith("admin:pack:add:"):
+        _, _, _, kind, weekday_s = data.split(":")
+        weekday = int(weekday_s)
+        ctx.user_data["awaiting_pack_message"] = True
+        ctx.user_data["pack_editor"] = {"kind": kind, "weekday": weekday, "mode": "add"}
+        await q.message.reply_text(f"Send the new {WEEKDAY_NAMES.get(weekday)} message now. Send /admin to cancel.")
+        return
+    if data.startswith("admin:pack:edit:"):
+        _, _, _, kind, weekday_s, index_s = data.split(":")
+        weekday, index = int(weekday_s), int(index_s)
+        messages = get_group_pack(kind, weekday)
+        if index < 0 or index >= len(messages):
+            await q.message.reply_text("That message is no longer available. Open the editor again.")
+            return
+        ctx.user_data["awaiting_pack_message"] = True
+        ctx.user_data["pack_editor"] = {"kind": kind, "weekday": weekday, "mode": "edit", "index": index}
+        await q.message.reply_text(f"Current message:\n\n{messages[index]}\n\nSend the replacement text now. Send /admin to cancel.")
+        return
+    if data.startswith("admin:pack:delete:"):
+        _, _, _, kind, weekday_s, index_s = data.split(":")
+        weekday, index = int(weekday_s), int(index_s)
+        messages = get_group_pack(kind, weekday)
+        if 0 <= index < len(messages):
+            messages.pop(index)
+            save_group_pack(kind, weekday, messages)
+            await q.message.reply_text("✅ Message deleted.")
+        else:
+            await q.message.reply_text("That message is no longer available.")
+        return
+    if data.startswith("admin:pack:reset:"):
+        _, _, _, kind, weekday_s = data.split(":")
+        weekday = int(weekday_s)
+        reset_group_pack(kind, weekday)
+        await q.message.reply_text(f"✅ {WEEKDAY_NAMES.get(weekday)} pack reset to the built-in defaults.")
         return
     if data == "admin:groupmsg:toggle":
         new_state = not group_messages_enabled()
@@ -1944,7 +2075,7 @@ def build_telegram_application():
     app.add_handler(CallbackQueryHandler(review_payment, pattern=r"^(ap|rj):\d+$"))
     app.add_handler(CallbackQueryHandler(choose_plan, pattern=r"^plan:(full|two)$"))
     app.add_handler(MessageHandler((filters.PHOTO | filters.Document.ALL) & filters.ChatType.PRIVATE, got_proof))
-    app.job_queue.run_daily(daily_reminders, time=time(9, 0, tzinfo=TZ))
+    # Automatic private payment reminders intentionally disabled.
     app.job_queue.run_daily(scheduled_group_morning, time=_parse_hhmm(GROUP_MORNING_TIME, "08:00"))
     app.job_queue.run_daily(scheduled_group_reminder, time=_parse_hhmm(GROUP_REMINDER_TIME, "17:00"))
     app.add_error_handler(telegram_error_handler)
