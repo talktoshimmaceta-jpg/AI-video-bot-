@@ -261,6 +261,98 @@ def group_messages_enabled():
 
 
 WEEKDAY_NAMES = {0: "Monday", 1: "Tuesday", 3: "Thursday", 4: "Friday"}
+CLASS_REMINDER_WEEKDAYS = {0: "Monday", 1: "Tuesday", 2: "Wednesday", 3: "Thursday", 4: "Friday", 5: "Saturday", 6: "Sunday"}
+CLASS_REMINDER_OFFSETS = (60, 30, 10, 0)
+
+
+def get_admin_class_reminders():
+    try:
+        with db() as c:
+            return c.execute(
+                "SELECT * FROM admin_class_reminders ORDER BY weekday,class_time,id"
+            ).fetchall()
+    except Exception as e:
+        log.warning("Could not read admin class reminders: %s", e)
+        return []
+
+
+def _format_class_time(value):
+    try:
+        h, m = [int(x) for x in str(value).split(":", 1)]
+        suffix = "AM" if h < 12 else "PM"
+        display_h = h % 12 or 12
+        return f"{display_h}:{m:02d} {suffix}"
+    except Exception:
+        return str(value)
+
+
+def _valid_hhmm(value):
+    try:
+        h, m = [int(x) for x in value.strip().split(":", 1)]
+        return 0 <= h <= 23 and 0 <= m <= 59
+    except Exception:
+        return False
+
+
+async def _send_admin_class_reminder(ctx, reminder, offset):
+    title = (reminder.get("title") or "Class").strip()
+    when = _format_class_time(reminder.get("class_time"))
+    if offset == 60:
+        timing = "starts in 1 hour"
+    elif offset == 30:
+        timing = "starts in 30 minutes"
+    elif offset == 10:
+        timing = "starts in 10 minutes"
+    else:
+        timing = "starts now"
+    message = (
+        f"⏰ CLASS REMINDER\n\n{title} {timing}.\n"
+        f"Scheduled time: {when} (Nigeria time)."
+    )
+    recipients = list(ADMIN_IDS)
+    if ADMIN_GROUP_ID:
+        recipients.append(ADMIN_GROUP_ID)
+    sent_to = set()
+    for recipient in recipients:
+        if recipient in sent_to:
+            continue
+        sent_to.add(recipient)
+        try:
+            await ctx.bot.send_message(recipient, message)
+        except Exception as e:
+            log.warning("Could not send class reminder to %s: %s", recipient, e)
+
+
+async def check_admin_class_reminders(ctx: ContextTypes.DEFAULT_TYPE):
+    """Check editable class schedules and notify admins at 60/30/10/0 minutes."""
+    current = now()
+    rows = get_admin_class_reminders()
+    for r in rows:
+        if not r.get("enabled", True) or int(r.get("weekday")) != current.weekday():
+            continue
+        try:
+            hh, mm = [int(x) for x in str(r.get("class_time")).split(":", 1)]
+        except Exception:
+            continue
+        class_dt = current.replace(hour=hh, minute=mm, second=0, microsecond=0)
+        minutes_to_class = (class_dt - current).total_seconds() / 60
+        for offset in CLASS_REMINDER_OFFSETS:
+            # Allow a two-minute window so a slightly delayed Render/job tick still sends once.
+            if offset - 2 < minutes_to_class <= offset:
+                occurrence = current.date().isoformat()
+                with db() as c:
+                    row = c.execute(
+                        "SELECT 1 FROM admin_class_reminder_log WHERE reminder_id=? AND occurrence_date=? AND offset_minutes=?",
+                        (r["id"], occurrence, offset),
+                    ).fetchone()
+                    if row:
+                        continue
+                    c.execute(
+                        "INSERT INTO admin_class_reminder_log(reminder_id,occurrence_date,offset_minutes,sent_at) VALUES(?,?,?,NOW())",
+                        (r["id"], occurrence, offset),
+                    )
+                await _send_admin_class_reminder(ctx, r, offset)
+
 
 
 def get_group_pack(kind, weekday):
@@ -316,7 +408,7 @@ def referral_count(student_no):
 # ---------- registration form ----------
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
-    if uid in ADMIN_IDS:
+    if uid in REVIEWER_IDS:
         await send_admin_dashboard(ctx, uid)
         return ConversationHandler.END
     if ctx.args:
@@ -773,8 +865,9 @@ async def review_cmd(update, ctx):
 
 
 async def chatid_cmd(update, ctx):
-    if update.effective_user.id in ADMIN_IDS:
-        await update.effective_message.reply_text(f"This chat ID is: {update.effective_chat.id}")
+    await update.effective_message.reply_text(
+        f"Your Telegram user ID: {update.effective_user.id}\nThis chat ID is: {update.effective_chat.id}"
+    )
 
 
 async def id_cmd(update, ctx):
@@ -1212,7 +1305,50 @@ async def student_private_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE
             await send_rules_page(ctx, uid, 0)
         return
 
-    if uid in ADMIN_IDS and ctx.user_data.get("awaiting_pack_message"):
+    if uid in ADMIN_IDS and ctx.user_data.get("awaiting_class_reminder_time"):
+        value = (msg.text or "").strip()
+        if not _valid_hhmm(value):
+            await msg.reply_text("Please use 24-hour HH:MM format, for example 09:30 or 19:00.")
+            return
+        state = ctx.user_data.get("new_class_reminder") or {}
+        state["class_time"] = value
+        ctx.user_data["new_class_reminder"] = state
+        ctx.user_data.pop("awaiting_class_reminder_time", None)
+        ctx.user_data["awaiting_class_reminder_title"] = True
+        await msg.reply_text(
+            "Now send a short class name, for example: Monday AI Video Class\n\n"
+            "The bot will remind admins 1 hour, 30 minutes, 10 minutes before, and again when class starts."
+        )
+        return
+
+    if uid in ADMIN_IDS and ctx.user_data.get("awaiting_class_reminder_title"):
+        title = (msg.text or "").strip()[:120]
+        if not title:
+            await msg.reply_text("Please send a short class name.")
+            return
+        state = ctx.user_data.get("new_class_reminder") or {}
+        weekday = state.get("weekday")
+        class_time = state.get("class_time")
+        if weekday is None or not class_time:
+            ctx.user_data.pop("awaiting_class_reminder_title", None)
+            ctx.user_data.pop("new_class_reminder", None)
+            await msg.reply_text("That reminder setup expired. Open /admin → Class Reminders and try again.")
+            return
+        with db() as c:
+            c.execute(
+                "INSERT INTO admin_class_reminders(weekday,class_time,title,enabled,created_at) VALUES(?,?,?,TRUE,NOW())",
+                (weekday, class_time, title),
+            )
+        ctx.user_data.pop("awaiting_class_reminder_title", None)
+        ctx.user_data.pop("new_class_reminder", None)
+        await msg.reply_text(
+            f"✅ Class reminder saved.\n\n{CLASS_REMINDER_WEEKDAYS[int(weekday)]} at {_format_class_time(class_time)}\n{title}\n\n"
+            "Admins will be reminded 1 hour, 30 minutes, 10 minutes before class, and at class start."
+        )
+        await send_admin_dashboard(ctx, uid)
+        return
+
+    if uid in REVIEWER_IDS and ctx.user_data.get("awaiting_pack_message"):
         state = ctx.user_data.get("pack_editor") or {}
         kind = state.get("kind")
         weekday = state.get("weekday")
@@ -1236,7 +1372,7 @@ async def student_private_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE
         await send_admin_dashboard(ctx, uid)
         return
 
-    if uid in ADMIN_IDS and ctx.user_data.get("awaiting_class_group_message"):
+    if uid in REVIEWER_IDS and ctx.user_data.get("awaiting_class_group_message"):
         custom_text = (msg.text or msg.caption or "").strip()
         if not custom_text:
             await msg.reply_text("Please send a text message, or send /admin to cancel.")
@@ -1244,7 +1380,7 @@ async def student_private_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE
         try:
             await send_class_group_message(ctx, custom_text[:4000])
             ctx.user_data.pop("awaiting_class_group_message", None)
-            await msg.reply_text("✅ Custom message sent to the class group.", reply_markup=admin_dashboard_keyboard())
+            await msg.reply_text("✅ Custom message sent to the class group.", reply_markup=dashboard_keyboard_for(uid))
         except Exception as e:
             await msg.reply_text(f"Could not send to the class group: {e}")
         return
@@ -1264,7 +1400,7 @@ async def student_private_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE
         await msg.reply_text(
             f"✅ Complimentary paid-class access granted to {student['name']} ({student['student_no']}).\n"
             f"Their recorded payment remains ₦{int(student.get('paid_amount') or 0):,}.",
-            reply_markup=admin_dashboard_keyboard(),
+            reply_markup=dashboard_keyboard_for(uid),
         )
         if PAID_CLASS_LINK:
             try:
@@ -1280,7 +1416,69 @@ async def student_private_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE
             await msg.reply_text("Access was recorded, but PAID_CLASS_LINK is not configured in Render yet.")
         return
 
+    if uid in REVIEWER_IDS and ctx.user_data.get("awaiting_review_score"):
+        sid = int(ctx.user_data.get("awaiting_review_score"))
+        raw = (msg.text or "").strip()
+        try:
+            score = int(raw)
+        except ValueError:
+            await msg.reply_text("Please send a whole-number score from 0 to 100.")
+            return
+        if score < 0 or score > 100:
+            await msg.reply_text("Score must be between 0 and 100.")
+            return
+        ctx.user_data.pop("awaiting_review_score", None)
+        ctx.user_data["awaiting_review_feedback"] = {"sid": sid, "status": "approved", "score": score}
+        await msg.reply_text("Score saved. Now send short feedback for the student. Type SKIP if no feedback is needed.")
+        return
+
+    if uid in REVIEWER_IDS and ctx.user_data.get("awaiting_review_feedback"):
+        state = ctx.user_data.get("awaiting_review_feedback") or {}
+        sid = int(state.get("sid"))
+        status = state.get("status") or "correction"
+        score = state.get("score")
+        feedback = (msg.text or msg.caption or "").strip()[:2000]
+        if feedback.upper() == "SKIP":
+            feedback = ""
+        if status == "correction" and not feedback:
+            await msg.reply_text("Please send a short correction note so the student knows what to fix.")
+            return
+        with db() as c:
+            r = c.execute("SELECT a.*,s.name,s.student_no,s.user_id FROM assignment_submissions a JOIN students s ON s.user_id=a.user_id WHERE a.id=?", (sid,)).fetchone()
+            if not r:
+                ctx.user_data.pop("awaiting_review_feedback", None)
+                await msg.reply_text("That submission could not be found.")
+                return
+            c.execute(
+                "UPDATE assignment_submissions SET review_status=?,score=?,reviewed_by=?,reviewed_at=?,review_note=? WHERE id=?",
+                (status, score, uid, now().isoformat(), feedback, sid),
+            )
+        ctx.user_data.pop("awaiting_review_feedback", None)
+        reviewer_name = update.effective_user.full_name or str(uid)
+        if status == "approved":
+            student_notice = f"✅ Your assignment '{r['assignment_key']}' has been reviewed and approved.\nScore: {score}/100"
+            if feedback:
+                student_notice += f"\nFeedback: {feedback}"
+            admin_note = f"✅ Assignment #{sid} reviewed by {reviewer_name}: {score}/100 — APPROVED"
+        else:
+            student_notice = f"🔁 Your assignment '{r['assignment_key']}' needs correction.\nFeedback: {feedback}"
+            admin_note = f"🔁 Assignment #{sid} reviewed by {reviewer_name}: CORRECTION REQUESTED"
+        try:
+            await ctx.bot.send_message(r["user_id"], student_notice)
+        except Exception as e:
+            log.warning("Could not send review result to student %s: %s", r["user_id"], e)
+        if ADMIN_GROUP_ID:
+            try:
+                await ctx.bot.send_message(ADMIN_GROUP_ID, admin_note)
+            except Exception as e:
+                log.warning("Could not post review result to admin group: %s", e)
+        await msg.reply_text("✅ Review recorded and the student has been notified.")
+        await send_admin_dashboard(ctx, uid)
+        return
+
     if uid in ADMIN_IDS:
+        return
+    if uid in REVIEWER_IDS:
         return
     s = get_student(uid)
     if not s:
@@ -1323,7 +1521,7 @@ async def student_private_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE
             cur = c.execute("INSERT INTO support_tickets(user_id,message,created_at) VALUES(?,?,?) RETURNING id", (uid,text,now().isoformat()))
             tid = cur.fetchone()["id"]
         s = get_student(uid)
-        for admin in ADMIN_IDS:
+        for admin in REVIEWER_IDS:
             await ctx.bot.send_message(admin, f"Support ticket #{tid}\nStudent: {s['name']} ({s['student_no']})\nTelegram: {uid}\n\n{text}", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Mark handled", callback_data=f"supportdone:{tid}")]]))
         ctx.user_data.pop("awaiting_support",None)
         await msg.reply_text("Your question has been sent to the Academy admins. We'll get back to you.")
@@ -1341,11 +1539,11 @@ async def student_private_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE
             c.execute("""INSERT INTO assignment_submissions(user_id,assignment_key,file_id,text,submitted_at) VALUES(?,?,?,?,?)
                        ON CONFLICT (user_id, assignment_key) DO UPDATE SET
                          file_id=EXCLUDED.file_id, text=EXCLUDED.text, submitted_at=EXCLUDED.submitted_at,
-                         review_status='pending', reviewed_by=NULL, reviewed_at=NULL, review_note=NULL""",
+                         review_status='pending', score=NULL, reviewed_by=NULL, reviewed_at=NULL, review_note=NULL""",
                       (uid,key,file_id,caption,now().isoformat()))
         ctx.user_data.pop("awaiting_assignment",None)
         await msg.reply_text(f"Your submission for '{key}' has been recorded for review.")
-        recipients = [ADMIN_GROUP_ID] if ADMIN_GROUP_ID else list(ADMIN_IDS)
+        recipients = [ADMIN_GROUP_ID] if ADMIN_GROUP_ID else list(REVIEWER_IDS)
         header = (f"Assignment submission\nStudent: {s['name']} ({s['student_no']})\n"
                   f"Task: {key}\nSubmitted: {now().isoformat()}\nTelegram ID: {uid}")
         with db() as c:
@@ -1355,8 +1553,7 @@ async def student_private_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE
             ).fetchone()
         sid = submission["id"] if submission else None
         review_kb = InlineKeyboardMarkup([[
-            InlineKeyboardButton("Approve", callback_data=f"assignmentreview:approve:{sid}"),
-            InlineKeyboardButton("Request correction", callback_data=f"assignmentreview:correction:{sid}"),
+            InlineKeyboardButton("📝 Open Review & Score", callback_data=f"reviewopen:{sid}"),
         ]]) if sid else None
         for recipient in recipients:
             await ctx.bot.send_message(recipient, header, reply_markup=review_kb)
@@ -1409,7 +1606,7 @@ async def group_moderation(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def moderation_decision(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q=update.callback_query
     if q.from_user.id not in ADMIN_IDS:
-        await q.answer("Admins only",show_alert=True); return
+        await q.answer("Full admins only",show_alert=True); return
     _, action, rid_s=q.data.split(":")
     rid=int(rid_s)
     with db() as c:
@@ -1433,8 +1630,8 @@ async def moderation_decision(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def support_decision(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q=update.callback_query
-    if q.from_user.id not in ADMIN_IDS:
-        await q.answer("Admins only",show_alert=True); return
+    if q.from_user.id not in REVIEWER_IDS:
+        await q.answer("Authorized admins/reviewers only",show_alert=True); return
     tid=int(q.data.split(":")[1])
     with db() as c:
         c.execute("UPDATE support_tickets SET status='handled',handled_by=? WHERE id=?",(q.from_user.id,tid))
@@ -1443,7 +1640,7 @@ async def support_decision(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 # ---------- PDF student-record export ----------
-def build_student_records_pdf(rows):
+def build_student_records_pdf(rows, include_sensitive=True):
     buf = io.BytesIO()
     buf.name = f"Heribhee_Student_Records_{now().strftime('%Y-%m-%d')}.pdf"
     doc = SimpleDocTemplate(
@@ -1468,44 +1665,54 @@ def build_student_records_pdf(rows):
         except Exception:
             pass
     story.append(Paragraph("HERIBHEE STUDIO - STUDENT RECORDS", title_style))
-    free_count = sum(1 for r in rows if r.get("free_access"))
-    paid_count = sum(1 for r in rows if r.get("status") == "paid")
-    revenue = sum(int(r.get("paid_amount") or 0) for r in rows)
-    story.append(Paragraph(
-        f"Generated {now().strftime('%d %b %Y, %I:%M %p')} (Nigeria time) &nbsp;&nbsp;|&nbsp;&nbsp; "
-        f"Students: {len(rows)} &nbsp;&nbsp;|&nbsp;&nbsp; Fully paid: {paid_count} &nbsp;&nbsp;|&nbsp;&nbsp; "
-        f"Free access: {free_count} &nbsp;&nbsp;|&nbsp;&nbsp; Confirmed revenue: ₦{revenue:,}",
-        meta,
-    ))
+    if include_sensitive:
+        free_count = sum(1 for r in rows if r.get("free_access"))
+        paid_count = sum(1 for r in rows if r.get("status") == "paid")
+        revenue = sum(int(r.get("paid_amount") or 0) for r in rows)
+        meta_text = (
+            f"Generated {now().strftime('%d %b %Y, %I:%M %p')} (Nigeria time) &nbsp;&nbsp;|&nbsp;&nbsp; "
+            f"Students: {len(rows)} &nbsp;&nbsp;|&nbsp;&nbsp; Fully paid: {paid_count} &nbsp;&nbsp;|&nbsp;&nbsp; "
+            f"Free access: {free_count} &nbsp;&nbsp;|&nbsp;&nbsp; Confirmed revenue: ₦{revenue:,}"
+        )
+    else:
+        meta_text = (
+            f"Generated {now().strftime('%d %b %Y, %I:%M %p')} (Nigeria time) &nbsp;&nbsp;|&nbsp;&nbsp; "
+            f"Students: {len(rows)} &nbsp;&nbsp;|&nbsp;&nbsp; Reviewer copy"
+        )
+    story.append(Paragraph(meta_text, meta))
     story.append(Spacer(1, 5*mm))
 
-    headers = ["Student ID", "Name", "Phone", "Email", "Occupation / Role", "Access", "Paid", "Registered", "Certificate"]
+    if include_sensitive:
+        headers = ["Student ID", "Name", "Phone", "Email", "Occupation / Role", "Access", "Paid", "Registered", "Certificate"]
+    else:
+        headers = ["Student ID", "Name", "Phone", "Email", "Occupation / Role", "Registered"]
     data = [[Paragraph(f"<b>{h}</b>", small) for h in headers]]
     for r in rows:
-        if r.get("free_access"):
-            access = "Complimentary"
-        elif r.get("status") == "paid":
-            access = "Paid"
-        elif r.get("status") == "part_paid":
-            access = "Part paid"
-        else:
-            access = "Registered"
-        cert = r.get("certificate_number") or ("Eligible" if r.get("certificate_eligible") else "-")
         reg = (r.get("registered_at") or "")[:10]
-        vals = [
-            r.get("student_no") or "-",
-            r.get("name") or "-",
-            r.get("phone") or "-",
-            r.get("email") or "-",
-            r.get("occupation") or r.get("category") or "-",
-            access,
-            f"₦{int(r.get('paid_amount') or 0):,}",
-            reg or "-",
-            cert,
-        ]
+        if include_sensitive:
+            if r.get("free_access"):
+                access = "Complimentary"
+            elif r.get("status") == "paid":
+                access = "Paid"
+            elif r.get("status") == "part_paid":
+                access = "Part paid"
+            else:
+                access = "Registered"
+            cert = r.get("certificate_number") or ("Eligible" if r.get("certificate_eligible") else "-")
+            vals = [
+                r.get("student_no") or "-", r.get("name") or "-", r.get("phone") or "-",
+                r.get("email") or "-", r.get("occupation") or r.get("category") or "-",
+                access, f"₦{int(r.get('paid_amount') or 0):,}", reg or "-", cert,
+            ]
+        else:
+            vals = [
+                r.get("student_no") or "-", r.get("name") or "-", r.get("phone") or "-",
+                r.get("email") or "-", r.get("occupation") or r.get("category") or "-", reg or "-",
+            ]
         data.append([Paragraph(escape(str(v)), small) for v in vals])
 
-    widths = [20*mm, 34*mm, 28*mm, 45*mm, 39*mm, 25*mm, 20*mm, 22*mm, 27*mm]
+    widths = ([20*mm, 34*mm, 28*mm, 45*mm, 39*mm, 25*mm, 20*mm, 22*mm, 27*mm]
+              if include_sensitive else [24*mm, 42*mm, 34*mm, 58*mm, 55*mm, 28*mm])
     table = Table(data, colWidths=widths, repeatRows=1, hAlign="CENTER")
     table.setStyle(TableStyle([
         ("BACKGROUND", (0,0), (-1,0), colors.HexColor("#12213D")),
@@ -1566,20 +1773,49 @@ def admin_dashboard_keyboard():
         [InlineKeyboardButton("💬 Support questions", callback_data="admin:support:0"), InlineKeyboardButton("📢 Message students", callback_data="admin:message")],
         [InlineKeyboardButton("📣 Group Messages", callback_data="admin:groupmsg"), InlineKeyboardButton("📄 Export PDF", callback_data="admin:export")],
         [InlineKeyboardButton("📊 Statistics", callback_data="admin:stats"), InlineKeyboardButton("🎁 Free Access", callback_data="admin:freeaccess")],
-        [InlineKeyboardButton("🆔 Show my Telegram ID", callback_data="admin:myid")],
+        [InlineKeyboardButton("⏰ Class Reminders", callback_data="admin:classreminders"), InlineKeyboardButton("🆔 Show my Telegram ID", callback_data="admin:myid")],
     ])
 
 
+def reviewer_dashboard_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("👨‍🎓 Student Records", callback_data="admin:students:0"), InlineKeyboardButton("✅ Pending Reviews", callback_data="admin:pending:0")],
+        [InlineKeyboardButton("💬 Support Questions", callback_data="admin:support:0"), InlineKeyboardButton("📣 Group Messages", callback_data="admin:groupmsg")],
+        [InlineKeyboardButton("📄 Export PDF", callback_data="admin:export"), InlineKeyboardButton("🆔 My Telegram ID", callback_data="admin:myid")],
+    ])
+
+
+def dashboard_keyboard_for(uid):
+    return admin_dashboard_keyboard() if uid in ADMIN_IDS else reviewer_dashboard_keyboard()
+
+
 async def send_admin_dashboard(ctx, uid):
-    await ctx.bot.send_message(uid, "HERIBHEE ACADEMY — ADMIN DASHBOARD\n\nChoose an admin function:", reply_markup=admin_dashboard_keyboard())
+    if uid in ADMIN_IDS:
+        title = "HERIBHEE ACADEMY — ADMIN DASHBOARD"
+    else:
+        title = "HERIBHEE ACADEMY — REVIEWER DASHBOARD"
+    await ctx.bot.send_message(uid, title + "\n\nChoose a function:", reply_markup=dashboard_keyboard_for(uid))
 
 
 async def admin_dashboard_callback(update, ctx):
     q=update.callback_query
     uid=q.from_user.id
     data=q.data
-    if uid not in ADMIN_IDS and not (uid in REVIEWER_IDS and data.startswith("admin:pending:")):
+    if uid not in REVIEWER_IDS:
         await q.answer("This admin function is not available to your account.", show_alert=True); return
+    if uid not in ADMIN_IDS:
+        reviewer_allowed = (
+            data in {"admin:home", "admin:myid", "admin:export", "admin:groupmsg", "admin:groupmsg:edit",
+                     "admin:groupmsg:morning", "admin:groupmsg:reminder", "admin:groupmsg:custom",
+                     "admin:groupmsg:testclass", "admin:groupmsg:testreview", "admin:groupmsg:toggle"}
+            or data.startswith("admin:students:")
+            or data.startswith("admin:pending:")
+            or data.startswith("admin:support:")
+            or data.startswith("admin:pack:")
+            or data.startswith("admin:groupmsg:")
+        )
+        if not reviewer_allowed:
+            await q.answer("This function is reserved for full admins.", show_alert=True); return
     await q.answer()
     if data == "admin:home":
         await send_admin_dashboard(ctx,uid); return
@@ -1593,6 +1829,62 @@ async def admin_dashboard_callback(update, ctx):
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Cancel", callback_data="admin:home")]])
         )
         return
+    if data == "admin:classreminders":
+        rows = get_admin_class_reminders()
+        lines = ["⏰ ADMIN CLASS REMINDERS", ""]
+        if rows:
+            for r in rows:
+                status = "ON" if r.get("enabled", True) else "OFF"
+                day = CLASS_REMINDER_WEEKDAYS.get(int(r.get("weekday")), str(r.get("weekday")))
+                lines.append(f"#{r['id']} • {day} • {_format_class_time(r['class_time'])} • {r.get('title') or 'Class'} • {status}")
+        else:
+            lines.append("No class reminders have been created yet.")
+        kb = [[InlineKeyboardButton("➕ Add Class Reminder", callback_data="admin:classreminders:add")]]
+        for r in rows[:12]:
+            kb.append([
+                InlineKeyboardButton(f"{'⛔' if r.get('enabled', True) else '✅'} #{r['id']}", callback_data=f"admin:classreminders:toggle:{r['id']}"),
+                InlineKeyboardButton(f"🗑 Delete #{r['id']}", callback_data=f"admin:classreminders:delete:{r['id']}")
+            ])
+        kb.append([InlineKeyboardButton("Admin dashboard", callback_data="admin:home")])
+        await q.message.reply_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(kb))
+        return
+    if data == "admin:classreminders:add":
+        kb = []
+        days = list(CLASS_REMINDER_WEEKDAYS.items())
+        for i in range(0, len(days), 2):
+            row = []
+            for day_no, day_name in days[i:i+2]:
+                row.append(InlineKeyboardButton(day_name, callback_data=f"admin:classreminders:day:{day_no}"))
+            kb.append(row)
+        kb.append([InlineKeyboardButton("Cancel", callback_data="admin:classreminders")])
+        await q.message.reply_text("Choose the class day:", reply_markup=InlineKeyboardMarkup(kb))
+        return
+    if data.startswith("admin:classreminders:day:"):
+        weekday = int(data.rsplit(":", 1)[1])
+        ctx.user_data["new_class_reminder"] = {"weekday": weekday}
+        ctx.user_data["awaiting_class_reminder_time"] = True
+        await q.message.reply_text(
+            f"Class day: {CLASS_REMINDER_WEEKDAYS[weekday]}\n\nSend the class time in 24-hour format, for example 19:00 for 7 PM."
+        )
+        return
+    if data.startswith("admin:classreminders:toggle:"):
+        rid = int(data.rsplit(":", 1)[1])
+        with db() as c:
+            r = c.execute("SELECT enabled FROM admin_class_reminders WHERE id=?", (rid,)).fetchone()
+            if not r:
+                await q.message.reply_text("Reminder not found.")
+                return
+            c.execute("UPDATE admin_class_reminders SET enabled=? WHERE id=?", (not bool(r["enabled"]), rid))
+        await q.message.reply_text("✅ Reminder status updated.")
+        await send_admin_dashboard(ctx, uid)
+        return
+    if data.startswith("admin:classreminders:delete:"):
+        rid = int(data.rsplit(":", 1)[1])
+        with db() as c:
+            c.execute("DELETE FROM admin_class_reminders WHERE id=?", (rid,))
+        await q.message.reply_text("🗑 Class reminder deleted.")
+        await send_admin_dashboard(ctx, uid)
+        return
     if data == "admin:stats":
         with db() as c:
             total=c.execute("SELECT COUNT(*) n FROM students").fetchone()["n"]
@@ -1605,10 +1897,12 @@ async def admin_dashboard_callback(update, ctx):
     if data == "admin:export":
         with db() as c:
             rows=c.execute("SELECT * FROM students ORDER BY student_no").fetchall()
-        out=build_student_records_pdf(rows)
+        out=build_student_records_pdf(rows, include_sensitive=(uid in ADMIN_IDS))
+        caption = ("📄 Heribhee Studio student records - full admin export" if uid in ADMIN_IDS
+                   else "📄 Heribhee Studio student records - reviewer export")
         await q.message.reply_document(
             out,
-            caption="📄 Heribhee Studio student records - clean PDF export",
+            caption=caption,
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Admin dashboard", callback_data="admin:home")]])
         )
         return
@@ -1802,8 +2096,12 @@ async def admin_dashboard_callback(update, ctx):
         await q.message.reply_text("\n".join(lines) if len(lines)>1 else "No student records yet.",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Admin dashboard",callback_data="admin:home")]])); return
     if data.startswith("admin:students:"):
         offset=int(data.rsplit(":",1)[1])
-        with db() as c: rows=c.execute("SELECT name,student_no,status,user_id FROM students ORDER BY name LIMIT 15 OFFSET ?",(offset,)).fetchall()
-        lines=[f"{r['name']} — {r['student_no']} — {r['status']} — Telegram {r['user_id']}" for r in rows]
+        with db() as c:
+            rows=c.execute("SELECT name,student_no,status,user_id,phone,email,occupation,category FROM students ORDER BY name LIMIT 15 OFFSET ?",(offset,)).fetchall()
+        if uid in ADMIN_IDS:
+            lines=[f"{r['name']} — {r['student_no']} — {r['status']} — Telegram {r['user_id']}" for r in rows]
+        else:
+            lines=[f"{r['name']} — {r['student_no']}\nRole: {r.get('occupation') or r.get('category') or '-'}\nPhone: {r.get('phone') or '-'}\nEmail: {r.get('email') or '-'}" for r in rows]
         kb=[]
         if offset: kb.append([InlineKeyboardButton("Previous",callback_data=f"admin:students:{max(0,offset-15)}")])
         if len(rows)==15: kb.append([InlineKeyboardButton("Next",callback_data=f"admin:students:{offset+15}")])
@@ -1830,7 +2128,15 @@ async def review_open_callback(update,ctx):
     if not r:
         await q.answer("Submission not found.",show_alert=True); return
     await q.answer()
-    await q.message.reply_text(f"REVIEW SUBMISSION #{sid}\nStudent: {r['name']} ({r['student_no']})\nAssignment: {r['assignment_key']}\nSubmitted: {r['submitted_at']}\n\nSubmission text: {r['text'] or '(No text)'}",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Approve",callback_data=f"assignmentreview:approve:{sid}"),InlineKeyboardButton("Request correction",callback_data=f"assignmentreview:correction:{sid}")]]))
+    current_score = f"{r.get('score')}/100" if r.get('score') is not None else "Not scored"
+    await ctx.bot.send_message(
+        q.from_user.id,
+        f"REVIEW SUBMISSION #{sid}\nStudent: {r['name']} ({r['student_no']})\nAssignment: {r['assignment_key']}\nSubmitted: {r['submitted_at']}\nCurrent score: {current_score}\n\nSubmission text: {r['text'] or '(No text)'}",
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("✅ Score & Approve",callback_data=f"assignmentreview:approve:{sid}"),
+            InlineKeyboardButton("🔁 Request Correction",callback_data=f"assignmentreview:correction:{sid}")
+        ]])
+    )
     if r['file_id']:
         try: await ctx.bot.send_document(q.from_user.id,r['file_id'],caption=f"Student {r['student_no']} — {r['assignment_key']}")
         except Exception:
@@ -1844,15 +2150,18 @@ async def assignment_review_decision(update,ctx):
         await q.answer("Authorized assignment reviewers only.",show_alert=True); return
     _,decision,sid_s=q.data.split(":"); sid=int(sid_s)
     with db() as c:
-        r=c.execute("SELECT a.*,s.name,s.student_no,s.user_id FROM assignment_submissions a JOIN students s ON s.user_id=a.user_id WHERE a.id=?",(sid,)).fetchone()
-        if not r: await q.answer("Submission not found.",show_alert=True); return
-        status="approved" if decision=="approve" else "correction"
-        c.execute("UPDATE assignment_submissions SET review_status=?,reviewed_by=?,reviewed_at=?,review_note=? WHERE id=?",(status,q.from_user.id,now().isoformat(),"Please review the feedback from your assignment admin and resubmit/contact the Academy." if status=="correction" else "",sid))
-    await q.answer("Decision recorded")
-    await q.edit_message_text((q.message.text or "")+f"\n\nDecision: {status.upper()} by {q.from_user.full_name}")
-    notice=(f"Your assignment '{r['assignment_key']}' has been approved. Well done!" if status=="approved" else f"Your assignment '{r['assignment_key']}' needs correction. Please contact your assignment admin for guidance.")
-    try: await ctx.bot.send_message(r['user_id'],notice)
-    except Exception: pass
+        r=c.execute("SELECT a.id,a.assignment_key,s.name,s.student_no FROM assignment_submissions a JOIN students s ON s.user_id=a.user_id WHERE a.id=?",(sid,)).fetchone()
+    if not r:
+        await q.answer("Submission not found.",show_alert=True); return
+    await q.answer()
+    if decision == "approve":
+        ctx.user_data["awaiting_review_score"] = sid
+        ctx.user_data.pop("awaiting_review_feedback", None)
+        await ctx.bot.send_message(q.from_user.id, f"Score {r['name']} ({r['student_no']}) for '{r['assignment_key']}'.\n\nSend a whole-number score from 0 to 100.")
+    else:
+        ctx.user_data["awaiting_review_feedback"] = {"sid": sid, "status": "correction", "score": None}
+        ctx.user_data.pop("awaiting_review_score", None)
+        await ctx.bot.send_message(q.from_user.id, f"Send the correction feedback for {r['name']} ({r['student_no']}). The student will receive this message privately.")
 
 
 # ---------- admin ----------
@@ -2052,7 +2361,7 @@ def build_telegram_application():
     app.add_handler(CommandHandler("id", id_cmd))
     app.add_handler(CommandHandler("chatid", chatid_cmd))
     app.add_handler(CommandHandler("review", review_cmd))
-    app.add_handler(CommandHandler("admin", lambda update, ctx: send_admin_dashboard(ctx, update.effective_user.id) if update.effective_user.id in ADMIN_IDS else None))
+    app.add_handler(CommandHandler("admin", lambda update, ctx: send_admin_dashboard(ctx, update.effective_user.id) if update.effective_user.id in REVIEWER_IDS else None))
     app.add_handler(CommandHandler("certificate", certificate_cmd))
     app.add_handler(CommandHandler("status", status_cmd))
     app.add_handler(CommandHandler("help", help_cmd))
@@ -2078,6 +2387,7 @@ def build_telegram_application():
     # Automatic private payment reminders intentionally disabled.
     app.job_queue.run_daily(scheduled_group_morning, time=_parse_hhmm(GROUP_MORNING_TIME, "08:00"))
     app.job_queue.run_daily(scheduled_group_reminder, time=_parse_hhmm(GROUP_REMINDER_TIME, "17:00"))
+    app.job_queue.run_repeating(check_admin_class_reminders, interval=60, first=15)
     app.add_error_handler(telegram_error_handler)
     return app
 
