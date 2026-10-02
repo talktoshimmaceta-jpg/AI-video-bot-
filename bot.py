@@ -522,13 +522,14 @@ async def got_goal(update, ctx):
 
 
 async def got_occupation(update, ctx):
-    occupation = update.message.text.strip()[:120]
+    occupation = (update.message.text or "").strip()[:120]
     if len(occupation) < 2:
-        await update.message.reply_text("Please type what you currently do.")
+        await update.message.reply_text("Please type what you currently do, for example: Student, Trader, Teacher, Video Editor or Content Creator.")
         return OCCUPATION
     ctx.user_data["occupation"] = occupation
+    log.info("Registration occupation captured for Telegram user %s", update.effective_user.id)
     await update.message.reply_text(
-        "Why does this training matter to you right now? Tell us briefly what you hope it will help you achieve."
+        f"Got it: {occupation}. ✅\n\nWhy does this training matter to you right now? Tell us briefly what you hope it will help you achieve."
     )
     return MOTIVATION
 
@@ -555,7 +556,15 @@ async def got_category(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     referred_by = d.get("referred_by")
     with db() as c:
-        next_no = c.execute("SELECT COUNT(*) n FROM students").fetchone()["n"] + 1
+        # Use the highest existing student number instead of COUNT(*).
+        # COUNT(*) can reuse an old number after a test/student record is deleted,
+        # which can make registration fail at the final step because student_no is unique.
+        row = c.execute(
+            """SELECT COALESCE(MAX(CAST(SUBSTRING(student_no FROM 4) AS INTEGER)), 0) AS max_no
+               FROM students
+               WHERE student_no ~ '^HB-[0-9]+$'"""
+        ).fetchone()
+        next_no = int(row["max_no"] or 0) + 1
         student_no = f"HB-{next_no:04d}"
         c.execute(
             """INSERT INTO students
@@ -1142,10 +1151,18 @@ def academy_assistant_answer(question, student=None):
 
 
 async def send_student_manual(ctx, uid):
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("▶ My Classes", callback_data="menu:classes"), InlineKeyboardButton("▶ Assignments", callback_data="menu:assignments")],
+        [InlineKeyboardButton("▶ Ask AI", callback_data="menu:assistant"), InlineKeyboardButton("▶ Ask Admin", callback_data="menu:ask")],
+        [InlineKeyboardButton("▶ Profile & Documents", callback_data="menu:profile"), InlineKeyboardButton("▶ My Progress", callback_data="menu:progress")],
+        [InlineKeyboardButton("▶ Rules", callback_data="menu:rules"), InlineKeyboardButton("▶ Payment & Status", callback_data="menu:status")],
+        [InlineKeyboardButton("▶ Refer a Friend", callback_data="menu:refer"), InlineKeyboardButton("▶ Help & FAQs", callback_data="menu:help")],
+        [InlineKeyboardButton("⬅ Main Menu", callback_data="menu:home")],
+    ])
     await ctx.bot.send_message(
         uid,
-        STUDENT_MANUAL,
-        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅ Main Menu", callback_data="menu:home")]]),
+        STUDENT_MANUAL + "\n\nHOW TO USE THIS MANUAL\nTap any ▶ button below to open that function immediately. You can return to the Student Manual whenever you need guidance.",
+        reply_markup=kb,
     )
 
 
@@ -1964,12 +1981,25 @@ Reviewer accounts cannot control payments, Free Access, certificates, referrals,
 
 
 async def send_admin_manual(ctx, uid):
-    text = FULL_ADMIN_MANUAL if uid in ADMIN_IDS else REVIEWER_MANUAL
-    await ctx.bot.send_message(
-        uid,
-        text,
-        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅ Dashboard", callback_data="admin:home")]]),
-    )
+    if uid in ADMIN_IDS:
+        text = FULL_ADMIN_MANUAL + "\n\nHOW TO USE THIS MANUAL\nTap any ▶ button below to open the feature immediately. This lets you learn the dashboard by using it, not only by reading about it."
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("▶ Students", callback_data="admin:students:0"), InlineKeyboardButton("▶ Payments", callback_data="admin:payments:0")],
+            [InlineKeyboardButton("▶ Pending Reviews", callback_data="admin:pending:0"), InlineKeyboardButton("▶ Certificates", callback_data="admin:certs")],
+            [InlineKeyboardButton("▶ Support", callback_data="admin:support:0"), InlineKeyboardButton("▶ Group Messages", callback_data="admin:groupmsg")],
+            [InlineKeyboardButton("▶ Export PDF", callback_data="admin:export"), InlineKeyboardButton("▶ Free Access", callback_data="admin:freeaccess")],
+            [InlineKeyboardButton("▶ Class Reminders", callback_data="admin:classreminders"), InlineKeyboardButton("▶ Statistics", callback_data="admin:stats")],
+            [InlineKeyboardButton("⬅ Dashboard", callback_data="admin:home")],
+        ])
+    else:
+        text = REVIEWER_MANUAL + "\n\nHOW TO USE THIS MANUAL\nTap any ▶ button below to open an allowed reviewer function immediately. Restricted owner-only functions are not shown."
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("▶ Student Records", callback_data="admin:students:0"), InlineKeyboardButton("▶ Pending Reviews", callback_data="admin:pending:0")],
+            [InlineKeyboardButton("▶ Support Questions", callback_data="admin:support:0"), InlineKeyboardButton("▶ Group Messages", callback_data="admin:groupmsg")],
+            [InlineKeyboardButton("▶ Export PDF", callback_data="admin:export"), InlineKeyboardButton("▶ My Telegram ID", callback_data="admin:myid")],
+            [InlineKeyboardButton("⬅ Dashboard", callback_data="admin:home")],
+        ])
+    await ctx.bot.send_message(uid, text, reply_markup=kb)
 
 
 # ---------- admin dashboard and assignment review ----------
