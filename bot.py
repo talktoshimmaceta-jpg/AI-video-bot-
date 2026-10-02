@@ -60,6 +60,7 @@ RULES_VERSION = os.getenv("RULES_VERSION", "2026-09-v1")
 DATABASE_URL = os.environ["DATABASE_URL"]
 WEBHOOK_URL = os.getenv("WEBHOOK_URL", "").rstrip("/")
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "")
+REMINDER_TRIGGER_SECRET = os.getenv("REMINDER_TRIGGER_SECRET", "").strip()
 CURRICULUM_FILE = os.getenv("CURRICULUM_FILE", "curriculum.pdf")
 LOGO_FILE = os.getenv("LOGO_FILE", "logo.png")
 # Registration/crash-course group. WHATSAPP_LINK is the primary Render key.
@@ -337,8 +338,9 @@ async def check_admin_class_reminders(ctx: ContextTypes.DEFAULT_TYPE):
         class_dt = current.replace(hour=hh, minute=mm, second=0, microsecond=0)
         minutes_to_class = (class_dt - current).total_seconds() / 60
         for offset in CLASS_REMINDER_OFFSETS:
-            # Allow a two-minute window so a slightly delayed Render/job tick still sends once.
-            if offset - 2 < minutes_to_class <= offset:
+            # Allow a twelve-minute grace window so a 5-10 minute external wake-up
+            # can still deliver the reminder once after Render has been asleep.
+            if offset - 12 < minutes_to_class <= offset:
                 occurrence = current.date().isoformat()
                 with db() as c:
                     row = c.execute(
@@ -1028,11 +1030,123 @@ def _clean_phone(value):
 def student_keyboard():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("📚 My Classes", callback_data="menu:classes"), InlineKeyboardButton("📝 Assignments", callback_data="menu:assignments")],
-        [InlineKeyboardButton("❓ Help & FAQs", callback_data="menu:help"), InlineKeyboardButton("💬 Ask Admin", callback_data="menu:ask")],
+        [InlineKeyboardButton("🤖 Ask AI", callback_data="menu:assistant"), InlineKeyboardButton("💬 Ask Admin", callback_data="menu:ask")],
+        [InlineKeyboardButton("❓ Help & FAQs", callback_data="menu:help"), InlineKeyboardButton("📖 Student Manual", callback_data="menu:manual")],
         [InlineKeyboardButton("📈 My Progress", callback_data="menu:progress"), InlineKeyboardButton("📜 Rules & Regulations", callback_data="menu:rules")],
         [InlineKeyboardButton("👥 Refer a Friend", callback_data="menu:refer"), InlineKeyboardButton("🎓 Certification", callback_data="menu:cert")],
         [InlineKeyboardButton("💳 Payment & Status", callback_data="menu:status"), InlineKeyboardButton("👤 My Profile & Documents", callback_data="menu:profile")],
     ])
+
+
+STUDENT_MANUAL = """📖 HERIBHEE STUDENT MANUAL
+
+📚 My Classes
+Opens your current class access. Before paid access is approved, it shows the free crash-course group. After approved payment or complimentary access, it shows the main paid-class link.
+
+📝 Assignments
+Shows assignment deadlines and the Submit Assignment button. Send your file, photo, video or text through the bot and include the assignment name. Your submission is sent for review.
+
+🤖 Ask AI
+A free Heribhee Academy assistant. Ask about registration, account recovery, rules, assignments, class access, certificates, profile/documents, referrals, payment procedure or how to use the bot. It uses Academy information only and will direct you to Ask Admin when human help is needed.
+
+💬 Ask Admin
+Use this for personal issues, unclear cases, corrections or anything the Academy assistant cannot resolve. Your question is sent privately to the admin/reviewer team.
+
+❓ Help & FAQs
+Quick answers to common questions about the training, assignments, certification, payments/referrals and conduct.
+
+📖 Student Manual
+Opens this guide again.
+
+📈 My Progress
+Shows assignments you have submitted and their review status.
+
+📜 Rules & Regulations
+Opens the Academy rules. New students must read and accept them before receiving the registration pack.
+
+👥 Refer a Friend
+Shows your personal referral link and referral count.
+
+🎓 Certification
+Shows your certificate status. Once the Academy issues your certificate, you can download it again from My Profile & Documents.
+
+💳 Payment & Status
+Use this only when the Academy asks students to make payment. It shows your recorded payment status and lets you submit proof for verification.
+
+👤 My Profile & Documents
+Re-download your Student ID and curriculum, update your name or occupation once, and re-download an issued certificate.
+
+🔐 Account Recovery
+If you move to a new phone but keep the same Telegram account, nothing changes. If you use a completely new Telegram account, send /start and choose Recover Existing Account. You will need your Student ID plus the phone number or email used during registration."""
+
+
+def academy_assistant_answer(question, student=None):
+    """Free rule-based Academy assistant. It never calls a paid AI service."""
+    q = " ".join((question or "").lower().strip().split())
+    if not q:
+        return "Please type a question about Heribhee Academy or how to use the bot."
+
+    if any(k in q for k in ("recover", "recovery", "new phone", "new telegram", "lost account", "change account")):
+        return (
+            "For account recovery: if you only changed phones but kept the same Telegram account, your record stays linked automatically. "
+            "If you now use a different Telegram account, send /start and choose Recover Existing Account. You will be asked for your Student ID and the phone number or email used during registration."
+        )
+    if any(k in q for k in ("sign up", "signup", "register", "registration", "join academy", "enrol", "enroll")):
+        return (
+            "To register, send /start and choose the new-student registration option. Complete the questions, then read and accept the Academy rules. "
+            "After that, the bot sends your Student ID, curriculum and free crash-course access."
+        )
+    if any(k in q for k in ("rule", "conduct", "abuse", "language", "group rule")):
+        return (
+            "The Academy rules cover respectful behaviour, assignment/submission expectations, class access and responsible participation. "
+            "Open Rules & Regulations from the student menu to read every section. If you need a ruling on a specific situation, use Ask Admin."
+        )
+    if any(k in q for k in ("assignment", "submit", "homework", "task", "deadline", "score", "mark")):
+        return (
+            "Open Assignments from the student menu. Current deadlines are: Monday task → Tuesday 6 PM, Tuesday task → Thursday 6 PM, "
+            "Thursday task → Friday 5 PM, and Friday milestone → Sunday 11:59 PM, Nigeria time. Use Submit Assignment and include the assignment name. "
+            "An authorized reviewer can score it and send feedback privately through the bot."
+        )
+    if any(k in q for k in ("class link", "my class", "paid class", "crash course", "class access", "access class")):
+        if student and (student.get("status") == "paid" or student.get("free_access") or student.get("bonus_sent")):
+            return "Your main class access is unlocked. Open My Classes and use the Join Paid Class button."
+        return (
+            "After registration and rules acceptance, My Classes gives you the free crash-course access. The separate main class appears after approved payment or complimentary/free access is granted by a full admin."
+        )
+    if any(k in q for k in ("certificate", "certification", "cert", "graduate", "completion")):
+        return (
+            "Certificates are issued after the required assignments/final project and Academy verification. Once yours has been issued, open My Profile & Documents → Get My Certificate to download it again anytime."
+        )
+    if any(k in q for k in ("id card", "student id", "curriculum", "profile", "document", "change name", "occupation", "role")):
+        return (
+            "Open My Profile & Documents. You can re-download your Student ID and curriculum there. You can also change your name once and your occupation/role once. "
+            "For another correction after that, use Ask Admin."
+        )
+    if any(k in q for k in ("payment", "pay", "bank", "receipt", "proof", "balance", "fee")):
+        return (
+            "The Academy will tell students when payment is open. When instructed, open Payment & Status in the bot, choose the appropriate payment option and submit your receipt for admin verification. "
+            "The bot does not send automatic payment reminders."
+        )
+    if any(k in q for k in ("free access", "complimentary", "referral", "refer", "friend")):
+        return (
+            "Open Refer a Friend to get your personal referral link and see your referral count. Complimentary paid-class access can also be granted directly by a full admin. "
+            "If complimentary access has been granted, My Classes will show the paid-class link without changing your recorded payment amount."
+        )
+    if any(k in q for k in ("help", "how bot", "how does", "menu", "button", "manual", "what can")):
+        return (
+            "Use Student Manual for a button-by-button guide. You can also ask me about registration, recovery, rules, assignments, classes, certificates, profile/documents, referrals or payment procedure."
+        )
+    return (
+        "I don't have a reliable Academy answer for that question. Please use Ask Admin so a person can help you rather than me guessing."
+    )
+
+
+async def send_student_manual(ctx, uid):
+    await ctx.bot.send_message(
+        uid,
+        STUDENT_MANUAL,
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅ Main Menu", callback_data="menu:home")]]),
+    )
 
 
 async def send_student_menu(ctx, uid, intro="Heribhee Academy Student Menu"):
@@ -1161,7 +1275,17 @@ async def menu_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         question, answer = items[int(n)]
         await q.message.reply_text(f"{question}\n\n{answer}", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅ Back to questions", callback_data=f"faq:{key}")],[InlineKeyboardButton("Main menu", callback_data="menu:home")]])); return
     if data == "menu:home":
+        ctx.user_data.pop("awaiting_academy_assistant", None)
         await send_student_menu(ctx, uid); return
+    if data == "menu:manual":
+        await send_student_manual(ctx, uid); return
+    if data == "menu:assistant":
+        ctx.user_data.pop("awaiting_support", None)
+        ctx.user_data["awaiting_academy_assistant"] = True
+        await q.message.reply_text(
+            "🤖 HERIBHEE ACADEMY ASSISTANT\n\nAsk me about registration, account recovery, rules, assignments, class access, certificates, profile/documents, referrals, payment procedure, or how to use the bot.\n\nI use Academy information only. For personal or unusual issues, I will direct you to Ask Admin.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Cancel", callback_data="menu:home")]])
+        ); return
     if data == "menu:help":
         kb = [[InlineKeyboardButton(v[0], callback_data=f"faq:{k}")] for k,v in FAQS.items()]
         kb.append([InlineKeyboardButton("Main menu", callback_data="menu:home")])
@@ -1188,6 +1312,7 @@ async def menu_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         ) if rows else "No assignments recorded yet.")
         await q.message.reply_text(text, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Main menu", callback_data="menu:home")]])); return
     if data == "menu:ask":
+        ctx.user_data.pop("awaiting_academy_assistant", None)
         ctx.user_data["awaiting_support"] = True
         await q.message.reply_text("Please type your question or describe the issue here. It will be sent privately to the Academy admins.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Cancel", callback_data="menu:home")]])); return
     if data == "menu:refer":
@@ -1484,6 +1609,22 @@ async def student_private_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE
     if not s:
         return
 
+    if ctx.user_data.get("awaiting_academy_assistant"):
+        question = (msg.text or msg.caption or "").strip()
+        if not question:
+            await msg.reply_text("Please type your question as text, or use the menu to cancel.")
+            return
+        answer = academy_assistant_answer(question, s)
+        await msg.reply_text(
+            answer,
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("Ask Another Question", callback_data="menu:assistant")],
+                [InlineKeyboardButton("💬 Ask Admin", callback_data="menu:ask"), InlineKeyboardButton("Main Menu", callback_data="menu:home")],
+            ]),
+        )
+        ctx.user_data.pop("awaiting_academy_assistant", None)
+        return
+
     if ctx.user_data.get("awaiting_profile_name"):
         new_name = (msg.text or "").strip()[:80]
         if len(new_name) < 2:
@@ -1738,30 +1879,97 @@ async def send_class_group_message(ctx, text):
     await ctx.bot.send_message(CLASS_GROUP_ID, text)
 
 
-async def scheduled_group_morning(ctx: ContextTypes.DEFAULT_TYPE):
+def _time_to_minutes(value):
+    try:
+        h, m = [int(x) for x in str(value).split(":", 1)]
+        return h * 60 + m
+    except Exception:
+        return None
+
+
+async def _send_group_schedule_once(ctx, kind, scheduled_time, require_due_window=False):
     if not group_messages_enabled() or not CLASS_GROUP_ID:
-        return
-    if now().weekday() not in {0, 1, 3, 4}:
-        return
-    text = _message_for("morning")
-    if text:
-        try:
-            await send_class_group_message(ctx, text)
-        except Exception as e:
-            log.warning("Could not send scheduled morning group message: %s", e)
+        return False
+    current = now()
+    if current.weekday() not in {0, 1, 3, 4}:
+        return False
+    if require_due_window:
+        target = _time_to_minutes(scheduled_time)
+        current_minute = current.hour * 60 + current.minute
+        if target is None or not (target <= current_minute <= target + 12):
+            return False
+    key = f"group_{kind}_sent_{current.date().isoformat()}"
+    if get_app_setting(key, "") == "sent":
+        return False
+    text = _message_for(kind, current)
+    if not text:
+        return False
+    try:
+        await send_class_group_message(ctx, text)
+        set_app_setting(key, "sent")
+        return True
+    except Exception as e:
+        log.warning("Could not send scheduled %s group message: %s", kind, e)
+        return False
+
+
+async def scheduled_group_morning(ctx: ContextTypes.DEFAULT_TYPE):
+    await _send_group_schedule_once(ctx, "morning", GROUP_MORNING_TIME, require_due_window=False)
 
 
 async def scheduled_group_reminder(ctx: ContextTypes.DEFAULT_TYPE):
-    if not group_messages_enabled() or not CLASS_GROUP_ID:
-        return
-    if now().weekday() not in {0, 1, 3, 4}:
-        return
-    text = _message_for("reminder")
-    if text:
-        try:
-            await send_class_group_message(ctx, text)
-        except Exception as e:
-            log.warning("Could not send scheduled class reminder: %s", e)
+    await _send_group_schedule_once(ctx, "reminder", GROUP_REMINDER_TIME, require_due_window=False)
+
+
+FULL_ADMIN_MANUAL = """📖 HERIBHEE FULL ADMIN MANUAL
+
+👨‍🎓 Students — Browse registered students and their records.
+💳 Payments — Review payment submissions and approve/reject them. Payment control is for full admins only.
+📝 Assignments — See assignment totals/status overview.
+✅ Pending Reviews — Open unmarked submissions. Full admins and authorized reviewers can review and score.
+🎓 Certificates — View certification progress. Certificate issuing remains under full-admin control.
+👥 Referrals — Review referral activity.
+💬 Support Questions — Read student support tickets and mark handled items.
+📢 Message Students — Send a private broadcast to the selected student audience.
+📣 Group Messages — Send class-group messages, edit the message pack, test group connections, and turn automatic class messages on/off.
+📄 Export PDF — Creates the full student-record PDF. Full-admin copies include payment/access/certificate information.
+📊 Statistics — Academy totals, confirmed revenue, paid/free-access counts and assignment figures.
+🎁 Free Access — Enter a Student ID to grant complimentary paid-class access without recording false revenue.
+⏰ Class Reminders — Create admin-only class reminders. The bot sends alerts 1 hour, 30 minutes, 10 minutes and at class time.
+🆔 Show my Telegram ID — Shows your personal Telegram user ID.
+📖 Admin Manual — Opens this guide.
+
+Assignment review: open Pending Reviews or use the button attached to a submission in the review group. Choose Score & Approve, enter 0–100, then feedback. Request Correction sends correction feedback instead.
+
+Security: never share your bot token, database URL, webhook secret or reminder trigger secret."""
+
+REVIEWER_MANUAL = """📖 HERIBHEE REVIEWER MANUAL
+
+👨‍🎓 Student Records — Browse the student records available to reviewers.
+✅ Pending Reviews — Opens assignments waiting to be marked. Tap Open Review, then Score & Approve or Request Correction.
+💬 Support Questions — Read student questions and mark handled items when resolved.
+📣 Group Messages — Send approved class-group messages, use the message pack, and test group connections.
+📄 Export PDF — Creates the reviewer copy of student records. Financial, free-access and certificate-control information is intentionally hidden.
+🆔 My Telegram ID — Shows your Telegram user ID.
+📖 Reviewer Manual — Opens this guide.
+
+HOW TO MARK AN ASSIGNMENT
+1. Open Pending Reviews, or tap Open Review & Score in the assignment-review group.
+2. Read/view the student's submission.
+3. Tap Score & Approve for completed work, enter a whole-number score from 0–100, then send short feedback.
+4. Tap Request Correction if work must be fixed, then type exactly what the student should correct.
+5. The bot records who reviewed it and sends the result privately to the student.
+
+Reviewer accounts cannot control payments, Free Access, certificates, referrals, revenue/statistics, private student broadcasts or class-reminder settings. Those functions are reserved for full admins."""
+
+
+async def send_admin_manual(ctx, uid):
+    text = FULL_ADMIN_MANUAL if uid in ADMIN_IDS else REVIEWER_MANUAL
+    await ctx.bot.send_message(
+        uid,
+        text,
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅ Dashboard", callback_data="admin:home")]]),
+    )
 
 
 # ---------- admin dashboard and assignment review ----------
@@ -1774,6 +1982,7 @@ def admin_dashboard_keyboard():
         [InlineKeyboardButton("📣 Group Messages", callback_data="admin:groupmsg"), InlineKeyboardButton("📄 Export PDF", callback_data="admin:export")],
         [InlineKeyboardButton("📊 Statistics", callback_data="admin:stats"), InlineKeyboardButton("🎁 Free Access", callback_data="admin:freeaccess")],
         [InlineKeyboardButton("⏰ Class Reminders", callback_data="admin:classreminders"), InlineKeyboardButton("🆔 Show my Telegram ID", callback_data="admin:myid")],
+        [InlineKeyboardButton("📖 Admin Manual", callback_data="admin:manual")],
     ])
 
 
@@ -1782,6 +1991,7 @@ def reviewer_dashboard_keyboard():
         [InlineKeyboardButton("👨‍🎓 Student Records", callback_data="admin:students:0"), InlineKeyboardButton("✅ Pending Reviews", callback_data="admin:pending:0")],
         [InlineKeyboardButton("💬 Support Questions", callback_data="admin:support:0"), InlineKeyboardButton("📣 Group Messages", callback_data="admin:groupmsg")],
         [InlineKeyboardButton("📄 Export PDF", callback_data="admin:export"), InlineKeyboardButton("🆔 My Telegram ID", callback_data="admin:myid")],
+        [InlineKeyboardButton("📖 Reviewer Manual", callback_data="admin:manual")],
     ])
 
 
@@ -1805,7 +2015,7 @@ async def admin_dashboard_callback(update, ctx):
         await q.answer("This admin function is not available to your account.", show_alert=True); return
     if uid not in ADMIN_IDS:
         reviewer_allowed = (
-            data in {"admin:home", "admin:myid", "admin:export", "admin:groupmsg", "admin:groupmsg:edit",
+            data in {"admin:home", "admin:myid", "admin:manual", "admin:export", "admin:groupmsg", "admin:groupmsg:edit",
                      "admin:groupmsg:morning", "admin:groupmsg:reminder", "admin:groupmsg:custom",
                      "admin:groupmsg:testclass", "admin:groupmsg:testreview", "admin:groupmsg:toggle"}
             or data.startswith("admin:students:")
@@ -1821,6 +2031,8 @@ async def admin_dashboard_callback(update, ctx):
         await send_admin_dashboard(ctx,uid); return
     if data == "admin:myid":
         await q.message.reply_text(f"Your Telegram user ID: {uid}"); return
+    if data == "admin:manual":
+        await send_admin_manual(ctx, uid); return
     if data == "admin:freeaccess":
         ctx.user_data["awaiting_free_access_student_id"] = True
         await q.message.reply_text(
@@ -2298,30 +2510,10 @@ async def broadcast(update, ctx):
     await update.message.reply_text(f"Sent to {sent} of {len(ids)}.")
 
 
-# ---------- automatic reminders (daily, 9am Lagos) ----------
+# ---------- legacy private payment reminders ----------
 async def daily_reminders(ctx: ContextTypes.DEFAULT_TYPE):
-    t = now()
-    with db() as c:
-        rows = c.execute("SELECT * FROM students WHERE status IN ('registered','part_paid') AND COALESCE(free_access,FALSE)=FALSE").fetchall()
-        for s in rows:
-            last = datetime.fromisoformat(s["last_reminded"]) if s["last_reminded"] else None
-            if last and (t - last) < timedelta(days=2):
-                continue
-            if s["status"] == "registered":
-                if (t - datetime.fromisoformat(s["registered_at"])) < timedelta(days=1):
-                    continue
-                text = f"Hi {s['name']}, your seat for the {PROGRAM} is not secured yet. Send /pay to get started."
-            else:
-                due = datetime.fromisoformat(s["second_due"]) if s["second_due"] else t
-                if due - t > timedelta(days=2):
-                    continue
-                text = f"Hi {s['name']}, your balance of N{PRICE_FULL - s['paid_amount']:,} is due soon. Send /pay to complete it."
-            try:
-                await ctx.bot.send_message(s["user_id"], text)
-                c.execute("UPDATE students SET last_reminded=? WHERE user_id=?", (t.isoformat(), s["user_id"]))
-            except Exception:
-                pass
-            await asyncio.sleep(0.05)
+    # Intentionally disabled. Heribhee Studio announces payment manually in class.
+    return
 
 
 async def telegram_error_handler(update: object, ctx: ContextTypes.DEFAULT_TYPE):
@@ -2440,6 +2632,34 @@ web = FastAPI(title="Heribhee Academy Bot", lifespan=lifespan)
 @web.get("/health")
 async def health():
     return {"status": "ok", "service": "Heribhee Academy Bot"}
+
+
+@web.api_route("/reminder-check", methods=["GET", "POST"])
+async def reminder_check(request: Request):
+    """External wake-up/check endpoint for free hosting.
+
+    Configure an external cron service to call this every 5 minutes. The secret
+    may be supplied as X-Reminder-Secret or ?secret=. Due sends are de-duplicated.
+    """
+    if not REMINDER_TRIGGER_SECRET:
+        raise HTTPException(status_code=503, detail="Reminder trigger is not configured")
+    supplied = request.headers.get("X-Reminder-Secret") or request.query_params.get("secret", "")
+    if supplied != REMINDER_TRIGGER_SECRET:
+        raise HTTPException(status_code=403, detail="Invalid reminder trigger secret")
+
+    class _Ctx:
+        bot = telegram_app.bot
+
+    ctx = _Ctx()
+    await check_admin_class_reminders(ctx)
+    morning_sent = await _send_group_schedule_once(ctx, "morning", GROUP_MORNING_TIME, require_due_window=True)
+    reminder_sent = await _send_group_schedule_once(ctx, "reminder", GROUP_REMINDER_TIME, require_due_window=True)
+    return {
+        "ok": True,
+        "checked_at": now().isoformat(),
+        "morning_sent": morning_sent,
+        "class_group_reminder_sent": reminder_sent,
+    }
 
 
 @web.post("/telegram")
