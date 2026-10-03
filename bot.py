@@ -1,8 +1,10 @@
 import asyncio
 import csv
 import io
+import json
 import logging
 import os
+import random
 from html import escape
 from contextlib import asynccontextmanager
 
@@ -79,6 +81,15 @@ BOT_USERNAME = os.getenv("BOT_USERNAME", "")
 REFERRAL_BONUS_THRESHOLD = int(os.getenv("REFERRAL_BONUS_THRESHOLD", "3"))
 REFERRAL_FREE_ACCESS_CAP = int(os.getenv("REFERRAL_FREE_ACCESS_CAP", "20"))
 TZ = ZoneInfo("Africa/Lagos")
+
+# Weekly knowledge-test system. Defaults are intentionally usable without new
+# Render variables; you may override them later if desired.
+WEEKLY_TEST_DURATION_MINUTES = int(os.getenv("WEEKLY_TEST_DURATION_MINUTES", "15"))
+WEEKLY_TEST_PASS_PERCENT = float(os.getenv("WEEKLY_TEST_PASS_PERCENT", "70"))
+WEEKLY_TEST_MAX_ATTEMPTS = int(os.getenv("WEEKLY_TEST_MAX_ATTEMPTS", "2"))
+WEEKLY_TEST_RETRY_COOLDOWN_MINUTES = int(os.getenv("WEEKLY_TEST_RETRY_COOLDOWN_MINUTES", "30"))
+WEEKLY_TEST_WINDOW_HOURS = int(os.getenv("WEEKLY_TEST_WINDOW_HOURS", "24"))
+WEEKLY_TEST_QUESTIONS_PER_ATTEMPT = int(os.getenv("WEEKLY_TEST_QUESTIONS_PER_ATTEMPT", "15"))
 
 # Class-group automation. Times are Lagos/Nigeria time and can be changed in Render.
 GROUP_MORNING_TIME = os.getenv("GROUP_MORNING_TIME", "08:00").strip()
@@ -273,6 +284,521 @@ def audit_log(actor_user_id, action, target_type="", target_id="", details=""):
     except Exception as e:
         log.warning("Audit log write failed for %s: %s", action, e)
 
+
+
+# ---------- weekly knowledge tests ----------
+def has_course_access(student):
+    """Paid, referral-bonus, or complimentary access unlocks paid-course features."""
+    if not student:
+        return False
+    return bool(student.get("status") == "paid" or student.get("free_access") or student.get("bonus_sent"))
+
+
+def get_open_test_release(week_number=None, cohort=None):
+    """Return an active test release that is currently inside its release window."""
+    cohort = cohort or active_cohort()
+    try:
+        with db() as c:
+            if week_number is None:
+                return c.execute(
+                    "SELECT * FROM weekly_test_releases WHERE cohort=? AND is_active=TRUE AND released_at<=NOW() AND closes_at>NOW() ORDER BY week_number DESC LIMIT 1",
+                    (cohort,),
+                ).fetchone()
+            return c.execute(
+                "SELECT * FROM weekly_test_releases WHERE cohort=? AND week_number=? AND is_active=TRUE AND released_at<=NOW() AND closes_at>NOW() LIMIT 1",
+                (cohort, int(week_number)),
+            ).fetchone()
+    except Exception as e:
+        log.warning("Could not read weekly test release: %s", e)
+        return None
+
+
+def get_test_release(week_number, cohort=None):
+    cohort = cohort or active_cohort()
+    try:
+        with db() as c:
+            return c.execute(
+                "SELECT * FROM weekly_test_releases WHERE cohort=? AND week_number=? LIMIT 1",
+                (cohort, int(week_number)),
+            ).fetchone()
+    except Exception:
+        return None
+
+
+def get_passed_test_weeks(uid):
+    try:
+        with db() as c:
+            rows = c.execute(
+                "SELECT DISTINCT week_number FROM weekly_test_attempts WHERE user_id=? AND passed=TRUE ORDER BY week_number",
+                (uid,),
+            ).fetchall()
+        return {int(r["week_number"]) for r in rows}
+    except Exception as e:
+        log.warning("Could not read passed weekly tests for %s: %s", uid, e)
+        return set()
+
+
+def weekly_test_results(uid):
+    try:
+        with db() as c:
+            return c.execute(
+                "SELECT DISTINCT ON (week_number) week_number,score,total_questions,percentage,passed,attempt_number,submitted_at "
+                "FROM weekly_test_attempts WHERE user_id=? AND submitted_at IS NOT NULL "
+                "ORDER BY week_number,attempt_number DESC",
+                (uid,),
+            ).fetchall()
+    except Exception:
+        return []
+
+
+def missing_weekly_tests(uid):
+    passed = get_passed_test_weeks(uid)
+    return [w for w in (1, 2, 3, 4) if w not in passed]
+
+
+def _attempt_option_order(attempt, question_id):
+    orders = attempt.get("option_orders") or {}
+    if isinstance(orders, str):
+        try:
+            orders = json.loads(orders)
+        except Exception:
+            orders = {}
+    return orders.get(str(question_id), [])
+
+
+def _attempt_question_order(attempt):
+    order = attempt.get("question_order") or []
+    if isinstance(order, str):
+        try:
+            order = json.loads(order)
+        except Exception:
+            order = []
+    return [int(x) for x in order]
+
+
+def _question_options(question):
+    opts = question.get("options") or []
+    if isinstance(opts, str):
+        try:
+            opts = json.loads(opts)
+        except Exception:
+            opts = []
+    return opts
+
+
+def get_active_attempt(uid, week_number):
+    try:
+        with db() as c:
+            return c.execute(
+                "SELECT * FROM weekly_test_attempts WHERE user_id=? AND week_number=? AND status='active' ORDER BY id DESC LIMIT 1",
+                (uid, int(week_number)),
+            ).fetchone()
+    except Exception:
+        return None
+
+
+def get_attempt(attempt_id):
+    with db() as c:
+        return c.execute("SELECT * FROM weekly_test_attempts WHERE id=?", (int(attempt_id),)).fetchone()
+
+
+def get_question(question_id):
+    with db() as c:
+        return c.execute("SELECT * FROM weekly_test_questions WHERE id=? AND is_active=TRUE", (int(question_id),)).fetchone()
+
+
+def _remaining_seconds(attempt):
+    try:
+        expires = datetime.fromisoformat(attempt["expires_at"])
+        if expires.tzinfo is None:
+            expires = expires.replace(tzinfo=TZ)
+        return max(0, int((expires - now()).total_seconds()))
+    except Exception:
+        return 0
+
+
+def _format_remaining(seconds):
+    mins, secs = divmod(max(0, int(seconds)), 60)
+    return f"{mins:02d}:{secs:02d}"
+
+
+def _result_keyboard(week_number, passed):
+    rows = []
+    if passed:
+        rows.append([InlineKeyboardButton(f"🚀 Open Week {week_number} Project", callback_data=f"project:week:{week_number}")])
+    rows.append([InlineKeyboardButton("📈 My Progress", callback_data="menu:progress")])
+    rows.append([InlineKeyboardButton("Main menu", callback_data="menu:home")])
+    return InlineKeyboardMarkup(rows)
+
+
+async def send_test_result(ctx, uid, attempt, auto_submitted=False):
+    passed = bool(attempt.get("passed"))
+    score = int(attempt.get("score") or 0)
+    total = int(attempt.get("total_questions") or WEEKLY_TEST_QUESTIONS_PER_ATTEMPT)
+    pct = float(attempt.get("percentage") or 0)
+    week = int(attempt["week_number"])
+    attempt_no = int(attempt.get("attempt_number") or 1)
+    prefix = "⏰ Time expired — your answers were submitted automatically.\n\n" if auto_submitted else ""
+    if passed:
+        body = (
+            f"{prefix}🎉 WEEK {week} KNOWLEDGE TEST COMPLETED\n\n"
+            f"Score: {score}/{total}\nPercentage: {pct:.1f}%\nResult: PASS ✅\nAttempt: {attempt_no} of {WEEKLY_TEST_MAX_ATTEMPTS}\n\n"
+            f"Your Week {week} project is now unlocked."
+        )
+    else:
+        attempts_left = max(0, WEEKLY_TEST_MAX_ATTEMPTS - attempt_no)
+        if attempts_left:
+            retry_at = attempt.get("retry_available_at")
+            retry_text = ""
+            if retry_at:
+                try:
+                    dt = datetime.fromisoformat(retry_at)
+                    retry_text = f"\nCorrection attempt available from {dt.astimezone(TZ).strftime('%I:%M %p')} (Nigeria time)."
+                except Exception:
+                    pass
+            extra = f"\nAttempts remaining: {attempts_left}.{retry_text}\nReview the week's lessons before retrying."
+        else:
+            extra = "\nNo automatic attempts remain. Contact the Academy if you need help."
+        body = (
+            f"{prefix}WEEK {week} KNOWLEDGE TEST COMPLETED\n\n"
+            f"Score: {score}/{total}\nPercentage: {pct:.1f}%\nResult: NOT YET PASSED\nPass mark: {WEEKLY_TEST_PASS_PERCENT:.0f}%\nAttempt: {attempt_no} of {WEEKLY_TEST_MAX_ATTEMPTS}{extra}"
+        )
+    await ctx.bot.send_message(uid, body, reply_markup=_result_keyboard(week, passed))
+
+
+def finalize_test_attempt(attempt_id, expired=False):
+    """Mark an attempt immediately from recorded answers and return the updated row."""
+    attempt = get_attempt(attempt_id)
+    if not attempt or attempt.get("status") != "active":
+        return attempt
+    with db() as c:
+        stats = c.execute(
+            "SELECT COUNT(*) answered, COALESCE(SUM(CASE WHEN is_correct THEN 1 ELSE 0 END),0) correct FROM weekly_test_answers WHERE attempt_id=?",
+            (attempt_id,),
+        ).fetchone()
+        score = int(stats["correct"] or 0)
+        total = int(attempt.get("total_questions") or WEEKLY_TEST_QUESTIONS_PER_ATTEMPT)
+        pct = round((score * 100.0 / total), 1) if total else 0.0
+        passed = pct >= WEEKLY_TEST_PASS_PERCENT
+        submitted_at = now()
+        retry_at = submitted_at + timedelta(minutes=WEEKLY_TEST_RETRY_COOLDOWN_MINUTES)
+        c.execute(
+            "UPDATE weekly_test_attempts SET status=?,submitted_at=?,score=?,percentage=?,passed=?,retry_available_at=? WHERE id=?",
+            ("expired" if expired else "submitted", submitted_at.isoformat(), score, pct, passed, retry_at.isoformat(), attempt_id),
+        )
+    return get_attempt(attempt_id)
+
+
+async def finalize_expired_test_attempts(ctx):
+    """Auto-submit expired tests. Called both by the app scheduler and /reminder-check."""
+    try:
+        with db() as c:
+            rows = c.execute(
+                "SELECT id,user_id FROM weekly_test_attempts WHERE status='active' AND expires_at<=NOW() ORDER BY id LIMIT 100"
+            ).fetchall()
+    except Exception as e:
+        log.warning("Could not scan expired weekly tests: %s", e)
+        return 0
+    count = 0
+    for row in rows:
+        attempt = finalize_test_attempt(row["id"], expired=True)
+        if attempt:
+            try:
+                await send_test_result(ctx, row["user_id"], attempt, auto_submitted=True)
+            except Exception as e:
+                log.warning("Could not send auto-submitted test result to %s: %s", row["user_id"], e)
+            count += 1
+    return count
+
+
+async def scheduled_expired_test_check(ctx: ContextTypes.DEFAULT_TYPE):
+    await finalize_expired_test_attempts(ctx)
+
+
+def _test_attempt_count(uid, week_number):
+    with db() as c:
+        row = c.execute(
+            "SELECT COUNT(*) n FROM weekly_test_attempts WHERE user_id=? AND week_number=?",
+            (uid, int(week_number)),
+        ).fetchone()
+    return int(row["n"] or 0)
+
+
+def _latest_attempt(uid, week_number):
+    with db() as c:
+        return c.execute(
+            "SELECT * FROM weekly_test_attempts WHERE user_id=? AND week_number=? ORDER BY attempt_number DESC LIMIT 1",
+            (uid, int(week_number)),
+        ).fetchone()
+
+
+def start_test_attempt(uid, week_number):
+    student = get_student(uid)
+    if not has_course_access(student):
+        return None, "Payment or approved complimentary access is required."
+    release = get_open_test_release(week_number, student.get("cohort") or active_cohort())
+    if not release:
+        return None, "This weekly test is not currently open."
+    passed = get_passed_test_weeks(uid)
+    if int(week_number) in passed:
+        return None, "You have already passed this week's test."
+    active = get_active_attempt(uid, week_number)
+    if active:
+        if _remaining_seconds(active) <= 0:
+            finalize_test_attempt(active["id"], expired=True)
+        else:
+            return active, None
+    latest = _latest_attempt(uid, week_number)
+    if latest:
+        if int(latest.get("attempt_number") or 0) >= WEEKLY_TEST_MAX_ATTEMPTS:
+            return None, "You have used all automatic attempts for this week."
+        retry_at = latest.get("retry_available_at")
+        if retry_at:
+            try:
+                dt = datetime.fromisoformat(retry_at)
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=TZ)
+                if now() < dt:
+                    return None, f"Your correction attempt opens at {dt.astimezone(TZ).strftime('%I:%M %p')} Nigeria time."
+            except Exception:
+                pass
+    with db() as c:
+        questions = c.execute(
+            "SELECT id FROM weekly_test_questions WHERE week_number=? AND is_active=TRUE ORDER BY id",
+            (int(week_number),),
+        ).fetchall()
+    ids = [int(r["id"]) for r in questions]
+    if not ids:
+        return None, "No questions are configured for this week yet."
+    count = min(WEEKLY_TEST_QUESTIONS_PER_ATTEMPT, len(ids))
+    question_order = random.sample(ids, count)
+    option_orders = {}
+    with db() as c:
+        for qid in question_order:
+            q = c.execute("SELECT options FROM weekly_test_questions WHERE id=?", (qid,)).fetchone()
+            opts = _question_options(q)
+            opt_ids = [str(o["id"]) for o in opts]
+            random.shuffle(opt_ids)
+            option_orders[str(qid)] = opt_ids
+    attempt_number = _test_attempt_count(uid, week_number) + 1
+    started = now()
+    expires = started + timedelta(minutes=WEEKLY_TEST_DURATION_MINUTES)
+    with db() as c:
+        row = c.execute(
+            "INSERT INTO weekly_test_attempts(user_id,cohort,week_number,attempt_number,started_at,expires_at,status,total_questions,question_order,option_orders,current_index) "
+            "VALUES(?,?,?,?,?,?,?,?,?::jsonb,?::jsonb,0) RETURNING *",
+            (uid, student.get("cohort") or active_cohort(), int(week_number), attempt_number, started.isoformat(), expires.isoformat(), "active", count, json.dumps(question_order), json.dumps(option_orders)),
+        ).fetchone()
+    audit_log(uid, "weekly_test_started", "weekly_test", f"week-{week_number}", f"attempt={attempt_number}")
+    return row, None
+
+
+async def render_test_question(ctx, uid, attempt, message=None):
+    if not attempt:
+        return
+    if _remaining_seconds(attempt) <= 0:
+        result = finalize_test_attempt(attempt["id"], expired=True)
+        await send_test_result(ctx, uid, result, auto_submitted=True)
+        return
+    order = _attempt_question_order(attempt)
+    idx = int(attempt.get("current_index") or 0)
+    if idx >= len(order):
+        result = finalize_test_attempt(attempt["id"], expired=False)
+        await send_test_result(ctx, uid, result)
+        return
+    qid = order[idx]
+    q = get_question(qid)
+    if not q:
+        result = finalize_test_attempt(attempt["id"], expired=False)
+        await send_test_result(ctx, uid, result)
+        return
+    options = {str(o["id"]): o["text"] for o in _question_options(q)}
+    option_order = _attempt_option_order(attempt, qid) or list(options)
+    letters = "ABCD"
+    kb = []
+    for i, opt_id in enumerate(option_order):
+        if opt_id not in options:
+            continue
+        kb.append([InlineKeyboardButton(f"{letters[i]}. {options[opt_id]}", callback_data=f"test:answer:{attempt['id']}:{qid}:{opt_id}")])
+    text = (
+        f"🧠 WEEK {attempt['week_number']} KNOWLEDGE TEST\n\n"
+        f"Question {idx+1} of {len(order)}\n"
+        f"Time remaining: {_format_remaining(_remaining_seconds(attempt))}\n\n"
+        f"{q['question_text']}"
+    )
+    markup = InlineKeyboardMarkup(kb)
+    if message is not None:
+        try:
+            await message.edit_text(text, reply_markup=markup)
+            return
+        except Exception:
+            pass
+    await ctx.bot.send_message(uid, text, reply_markup=markup)
+
+
+async def weekly_test_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    uid = q.from_user.id
+    data = q.data
+    student = get_student(uid)
+    if not has_course_access(student):
+        await q.answer("This feature is available after payment/access approval.", show_alert=True)
+        return
+    if data.startswith("project:week:"):
+        await q.answer()
+        week = int(data.rsplit(":", 1)[1])
+        if week not in get_passed_test_weeks(uid):
+            await q.message.reply_text("Your weekly project unlocks after you pass this week's knowledge test.")
+            return
+        await q.message.reply_text(
+            f"🚀 WEEK {week} PROJECT UNLOCKED\n\n"
+            "Use the weekly project brief given by your instructor/live session. Complete the practical project, then submit it through Assignments in this bot.\n\n"
+            "The knowledge test is only the checkpoint; the project is where you prove the practical skill.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📝 Submit Assignment", callback_data="assignment:submitinfo")],[InlineKeyboardButton("Main menu", callback_data="menu:home")]])
+        )
+        return
+    if data.startswith("test:start:"):
+        await q.answer()
+        week = int(data.rsplit(":", 1)[1])
+        release = get_open_test_release(week, student.get("cohort") or active_cohort())
+        if not release:
+            await q.message.reply_text("This weekly test is not currently open.")
+            return
+        latest = _latest_attempt(uid, week)
+        if latest and latest.get("passed"):
+            await q.message.reply_text(f"✅ You already passed Week {week}: {latest.get('score')}/{latest.get('total_questions')} ({float(latest.get('percentage') or 0):.1f}%).")
+            return
+        active = get_active_attempt(uid, week)
+        if active and _remaining_seconds(active) > 0:
+            await render_test_question(ctx, uid, active)
+            return
+        attempts = _test_attempt_count(uid, week)
+        if attempts >= WEEKLY_TEST_MAX_ATTEMPTS:
+            await q.message.reply_text("You have used all automatic attempts for this week. Please contact the Academy if you need help.")
+            return
+        await q.message.reply_text(
+            f"🧠 WEEK {week} KNOWLEDGE TEST\n\n"
+            f"Questions: up to {WEEKLY_TEST_QUESTIONS_PER_ATTEMPT}\nTime: {WEEKLY_TEST_DURATION_MINUTES} minutes\nPass mark: {WEEKLY_TEST_PASS_PERCENT:.0f}%\nMaximum attempts: {WEEKLY_TEST_MAX_ATTEMPTS}\n\n"
+            "The timer starts only after you press START NOW. Once started, it cannot be paused. The bot marks the test automatically and shows your result immediately.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("✅ START NOW", callback_data=f"test:confirm:{week}")],[InlineKeyboardButton("Not now", callback_data="menu:home")]])
+        )
+        return
+    if data.startswith("test:confirm:"):
+        await q.answer()
+        week = int(data.rsplit(":", 1)[1])
+        attempt, error = start_test_attempt(uid, week)
+        if error:
+            await q.message.reply_text(error, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Main menu", callback_data="menu:home")]]))
+            return
+        await render_test_question(ctx, uid, attempt, message=q.message)
+        return
+    if data.startswith("test:answer:"):
+        parts = data.split(":")
+        if len(parts) != 5:
+            await q.answer("Invalid test response.", show_alert=True); return
+        _, _, attempt_id_s, question_id_s, option_id = parts
+        attempt_id = int(attempt_id_s); question_id = int(question_id_s)
+        attempt = get_attempt(attempt_id)
+        if not attempt or int(attempt.get("user_id") or 0) != uid:
+            await q.answer("This test attempt does not belong to your account.", show_alert=True); return
+        if attempt.get("status") != "active":
+            await q.answer("This attempt is already closed.", show_alert=True); return
+        if _remaining_seconds(attempt) <= 0:
+            await q.answer("Time is up.", show_alert=True)
+            result = finalize_test_attempt(attempt_id, expired=True)
+            await send_test_result(ctx, uid, result, auto_submitted=True)
+            return
+        order = _attempt_question_order(attempt)
+        idx = int(attempt.get("current_index") or 0)
+        if idx >= len(order) or int(order[idx]) != question_id:
+            await q.answer("That question is no longer active.", show_alert=True); return
+        question = get_question(question_id)
+        if not question:
+            await q.answer("Question unavailable.", show_alert=True); return
+        valid_ids = {str(o["id"]) for o in _question_options(question)}
+        if option_id not in valid_ids:
+            await q.answer("Invalid answer.", show_alert=True); return
+        is_correct = option_id == str(question["correct_option_id"])
+        try:
+            with db() as c:
+                c.execute(
+                    "INSERT INTO weekly_test_answers(attempt_id,question_id,selected_option_id,is_correct,answered_at) VALUES(?,?,?,?,NOW()) ON CONFLICT (attempt_id,question_id) DO NOTHING",
+                    (attempt_id, question_id, option_id, is_correct),
+                )
+                c.execute("UPDATE weekly_test_attempts SET current_index=current_index+1 WHERE id=?", (attempt_id,))
+        except Exception as e:
+            log.warning("Could not record test answer: %s", e)
+            await q.answer("Could not record that answer. Please tap again.", show_alert=True); return
+        await q.answer("Answer recorded")
+        updated = get_attempt(attempt_id)
+        if int(updated.get("current_index") or 0) >= len(order):
+            result = finalize_test_attempt(attempt_id, expired=False)
+            try:
+                await q.message.edit_text("✅ Final answer recorded. Marking your test...")
+            except Exception:
+                pass
+            await send_test_result(ctx, uid, result)
+            return
+        await render_test_question(ctx, uid, updated, message=q.message)
+        return
+
+
+async def release_weekly_test(ctx, admin_uid, week_number):
+    cohort = active_cohort()
+    released = now()
+    closes = released + timedelta(hours=WEEKLY_TEST_WINDOW_HOURS)
+    with db() as c:
+        c.execute(
+            "INSERT INTO weekly_test_releases(cohort,week_number,released_at,closes_at,released_by,is_active) VALUES(?,?,?,?,?,TRUE) "
+            "ON CONFLICT (cohort,week_number) DO UPDATE SET released_at=EXCLUDED.released_at,closes_at=EXCLUDED.closes_at,released_by=EXCLUDED.released_by,is_active=TRUE",
+            (cohort, int(week_number), released.isoformat(), closes.isoformat(), admin_uid),
+        )
+        students = c.execute(
+            "SELECT user_id FROM students WHERE COALESCE(archived,FALSE)=FALSE AND cohort=? AND (status='paid' OR COALESCE(free_access,FALSE)=TRUE OR COALESCE(bonus_sent,FALSE)=TRUE)",
+            (cohort,),
+        ).fetchall()
+    sent = 0
+    for s in students:
+        try:
+            await ctx.bot.send_message(
+                s["user_id"],
+                f"🧠 WEEK {week_number} KNOWLEDGE TEST IS NOW LIVE\n\n"
+                "The live session has ended. Complete this short knowledge check before starting your weekly project.\n\n"
+                f"Questions: {WEEKLY_TEST_QUESTIONS_PER_ATTEMPT}\nTime once started: {WEEKLY_TEST_DURATION_MINUTES} minutes\nPass mark: {WEEKLY_TEST_PASS_PERCENT:.0f}%\n"
+                f"Available until: {closes.strftime('%a, %d %b %Y %I:%M %p')} Nigeria time\n\n"
+                "Your project unlocks immediately after you pass.",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(f"START WEEK {week_number} TEST", callback_data=f"test:start:{week_number}")]])
+            )
+            sent += 1
+        except Exception as e:
+            log.warning("Could not notify student %s of weekly test: %s", s["user_id"], e)
+        await asyncio.sleep(0.03)
+    audit_log(admin_uid, "weekly_test_released", "weekly_test", f"week-{week_number}", f"cohort={cohort}; notified={sent}")
+    return sent, closes
+
+
+async def send_weekly_test_admin_panel(ctx, uid):
+    cohort = active_cohort()
+    lines = ["🧠 WEEKLY KNOWLEDGE TESTS", f"Cohort: {cohort}", "", "Release a test immediately after that week's live session."]
+    kb = []
+    for week in (1, 2, 3, 4):
+        rel = get_test_release(week, cohort)
+        if rel and rel.get("is_active") and rel.get("closes_at"):
+            try:
+                close_dt = datetime.fromisoformat(rel["closes_at"])
+                open_now = get_open_test_release(week, cohort) is not None
+                status = f"LIVE until {close_dt.astimezone(TZ).strftime('%d %b %I:%M %p')}" if open_now else "Closed"
+            except Exception:
+                status = "Released"
+        else:
+            status = "Not released"
+        lines.append(f"Week {week}: {status}")
+        kb.append([
+            InlineKeyboardButton(f"🎙 Release Week {week}", callback_data=f"admin:tests:release:{week}"),
+            InlineKeyboardButton(f"📊 W{week} Results", callback_data=f"admin:tests:results:{week}"),
+        ])
+    kb.append([InlineKeyboardButton("Admin dashboard", callback_data="admin:home")])
+    await ctx.bot.send_message(uid, "\n".join(lines), reply_markup=InlineKeyboardMarkup(kb))
 
 def certificate_verify_url(cert_no):
     base = (os.getenv("RENDER_EXTERNAL_URL", "").strip() or WEBHOOK_URL).rstrip("/")
@@ -1088,15 +1614,26 @@ def _clean_phone(value):
     return "".join(ch for ch in (value or "") if ch.isdigit())
 
 
-def student_keyboard():
-    return InlineKeyboardMarkup([
+def student_keyboard(uid=None):
+    rows = [
         [InlineKeyboardButton("📚 My Classes", callback_data="menu:classes"), InlineKeyboardButton("📝 Assignments", callback_data="menu:assignments")],
+    ]
+    # Weekly tests are intentionally invisible until both conditions are true:
+    # (1) paid/approved course access and (2) the admin has released the test after the live session.
+    if uid is not None:
+        s = get_student(uid)
+        if has_course_access(s):
+            rel = get_open_test_release(cohort=(s.get("cohort") or active_cohort()))
+            if rel and int(rel["week_number"]) not in get_passed_test_weeks(uid):
+                rows.append([InlineKeyboardButton(f"🧠 Week {rel['week_number']} Knowledge Test", callback_data=f"test:start:{rel['week_number']}")])
+    rows += [
         [InlineKeyboardButton("🤖 Ask AI", callback_data="menu:assistant"), InlineKeyboardButton("💬 Ask Admin", callback_data="menu:ask")],
         [InlineKeyboardButton("❓ Help & FAQs", callback_data="menu:help"), InlineKeyboardButton("📖 Student Manual", callback_data="menu:manual")],
         [InlineKeyboardButton("📈 My Progress", callback_data="menu:progress"), InlineKeyboardButton("📜 Rules & Regulations", callback_data="menu:rules")],
         [InlineKeyboardButton("👥 Refer a Friend", callback_data="menu:refer"), InlineKeyboardButton("🎓 Certification", callback_data="menu:cert")],
         [InlineKeyboardButton("💳 Payment & Status", callback_data="menu:status"), InlineKeyboardButton("👤 My Profile & Documents", callback_data="menu:profile")],
-    ])
+    ]
+    return InlineKeyboardMarkup(rows)
 
 
 STUDENT_MANUAL = """📖 HERIBHEE STUDENT MANUAL
@@ -1105,7 +1642,7 @@ STUDENT_MANUAL = """📖 HERIBHEE STUDENT MANUAL
 Opens your current class access. Before paid access is approved, it shows the free crash-course group. After approved payment or complimentary access, it shows the main paid-class link.
 
 📝 Assignments
-Shows assignment deadlines and the Submit Assignment button. Send your file, photo, video or text through the bot and include the assignment name. Your submission is sent for review.
+Shows assignment deadlines and the Submit Assignment button. After a weekly live session, paid/approved students complete the short knowledge test first; passing it unlocks that week’s project. Send your project/file/photo/video/text through the bot and include the assignment name.
 
 🤖 Ask AI
 A free Heribhee Academy assistant. Ask about registration, account recovery, rules, assignments, class access, certificates, profile/documents, referrals, payment procedure or how to use the bot. It uses Academy information only and will direct you to Ask Admin when human help is needed.
@@ -1120,7 +1657,7 @@ Quick answers to common questions about the training, assignments, certification
 Opens this guide again.
 
 📈 My Progress
-Shows assignments you have submitted and their review status.
+Shows assignments you have submitted, review status, and weekly knowledge-test results.
 
 📜 Rules & Regulations
 Opens the Academy rules. New students must read and accept them before receiving the registration pack.
@@ -1219,7 +1756,7 @@ async def send_student_manual(ctx, uid):
 
 
 async def send_student_menu(ctx, uid, intro="Heribhee Academy Student Menu"):
-    await ctx.bot.send_message(uid, intro + "\n\nChoose an option:", reply_markup=student_keyboard())
+    await ctx.bot.send_message(uid, intro + "\n\nChoose an option:", reply_markup=student_keyboard(uid))
 
 
 async def send_rules_page(ctx, uid, page):
@@ -1368,17 +1905,35 @@ async def menu_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await send_rules_page(ctx, uid, 0); return
         await deliver_class_access(ctx, uid); return
     if data == "menu:assignments":
-        await q.message.reply_text("Assignment deadlines (Nigeria time):\n• Monday task — Tuesday, 6 PM\n• Tuesday task — Thursday, 6 PM\n• Thursday task — Friday, 5 PM\n• Friday milestone — Sunday, 11:59 PM\n\nSubmit before the stated deadline. Use Ask Admin if you need help with a submission.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Submit assignment", callback_data="assignment:submitinfo")],[InlineKeyboardButton("Main menu", callback_data="menu:home")]])); return
+        s = get_student(uid)
+        kb = []
+        if has_course_access(s):
+            for week in sorted(get_passed_test_weeks(uid)):
+                kb.append([InlineKeyboardButton(f"🚀 Week {week} Project — Unlocked", callback_data=f"project:week:{week}")])
+        kb.append([InlineKeyboardButton("Submit assignment", callback_data="assignment:submitinfo")])
+        kb.append([InlineKeyboardButton("Main menu", callback_data="menu:home")])
+        await q.message.reply_text(
+            "ASSIGNMENTS & WEEKLY PROJECTS\n\n"
+            "Regular assignments can be submitted here. Each major weekly project unlocks after you pass the short knowledge test released at the end of that week's live session.\n\n"
+            "Use Ask Admin if you need help with a submission.",
+            reply_markup=InlineKeyboardMarkup(kb)
+        ); return
     if data == "assignment:submitinfo":
         ctx.user_data["awaiting_assignment"] = True
         await q.message.reply_text("Send your assignment as a document, photo, video, or text in this private chat. Include the assignment name in your message/caption. Your submission will be recorded for admin review.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Cancel", callback_data="menu:home")]])); return
     if data == "menu:progress":
         with db() as c:
             rows = c.execute("SELECT assignment_key, submitted_at, review_status FROM assignment_submissions WHERE user_id=? ORDER BY submitted_at", (uid,)).fetchall()
-        text = "Your recorded submissions:\n" + ("\n".join(
+        assignment_text = "\n".join(
             f"• {r['assignment_key']} — {r['submitted_at'][:16].replace('T',' ')} — {str(r['review_status'] or 'pending').replace('_',' ').title()}"
             for r in rows
-        ) if rows else "No assignments recorded yet.")
+        ) if rows else "No assignments recorded yet."
+        test_rows = weekly_test_results(uid)
+        test_text = "\n".join(
+            f"• Week {r['week_number']} — {r['score']}/{r['total_questions']} ({float(r['percentage'] or 0):.1f}%) — {'PASS ✅' if r['passed'] else 'Not passed'}"
+            for r in test_rows
+        ) if test_rows else "No weekly test results yet."
+        text = f"YOUR PROGRESS\n\nAssignments\n{assignment_text}\n\nWeekly Knowledge Tests\n{test_text}"
         await q.message.reply_text(text, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Main menu", callback_data="menu:home")]])); return
     if data == "menu:ask":
         ctx.user_data.pop("awaiting_academy_assistant", None)
@@ -1396,7 +1951,7 @@ async def menu_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if not s: await q.message.reply_text("Please register first with /start."); return
         if s.get("certificate_issued_at") and s.get("certificate_number"):
             await q.message.reply_text("Your certificate has already been issued. You can re-download it anytime from My Profile & Documents.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🎓 Get My Certificate", callback_data="profile:certificate")],[InlineKeyboardButton("Main menu", callback_data="menu:home")]])); return
-        await q.message.reply_text("Your certificate has not been issued yet. Certification requires the final project and at least four assignments, followed by Academy verification."); return
+        await q.message.reply_text("Your certificate has not been issued yet. Certification requires the Academy project requirements, all four weekly knowledge tests, and final Academy verification/oral defense where applicable."); return
     if data == "menu:status":
         s=get_student(uid)
         if not s:
@@ -2057,6 +2612,7 @@ FULL_ADMIN_MANUAL = """📖 HERIBHEE FULL ADMIN MANUAL
 📊 Statistics — Academy totals, confirmed revenue, paid/free-access counts and assignment figures.
 🎁 Free Access — Enter a Student ID to grant complimentary paid-class access without recording false revenue.
 ⏰ Class Reminders — Create admin-only class reminders. The bot sends alerts 1 hour, 30 minutes, 10 minutes and at class time.
+🧠 Weekly Tests — After each live session, release that week’s 15-minute knowledge test. The bot randomizes questions/options, marks instantly, and unlocks the weekly project after a pass.
 🆔 Show my Telegram ID — Shows your personal Telegram user ID.
 📖 Admin Manual — Opens this guide.
 
@@ -2122,8 +2678,8 @@ def admin_dashboard_keyboard():
         [InlineKeyboardButton("💬 Support questions", callback_data="admin:support:0"), InlineKeyboardButton("📢 Message students", callback_data="admin:message")],
         [InlineKeyboardButton("📣 Group Messages", callback_data="admin:groupmsg"), InlineKeyboardButton("📄 Export PDF", callback_data="admin:export")],
         [InlineKeyboardButton("📊 Statistics", callback_data="admin:stats"), InlineKeyboardButton("🎁 Free Access", callback_data="admin:freeaccess")],
-        [InlineKeyboardButton("⏰ Class Reminders", callback_data="admin:classreminders"), InlineKeyboardButton("🆔 Show my Telegram ID", callback_data="admin:myid")],
-        [InlineKeyboardButton("📖 Admin Manual", callback_data="admin:manual")],
+        [InlineKeyboardButton("⏰ Class Reminders", callback_data="admin:classreminders"), InlineKeyboardButton("🧠 Weekly Tests", callback_data="admin:tests")],
+        [InlineKeyboardButton("🆔 Show my Telegram ID", callback_data="admin:myid"), InlineKeyboardButton("📖 Admin Manual", callback_data="admin:manual")],
     ])
 
 
@@ -2318,6 +2874,34 @@ async def admin_dashboard_callback(update, ctx):
             c.execute("DELETE FROM admin_class_reminders WHERE id=?", (rid,))
         await q.message.reply_text("🗑 Class reminder deleted.")
         await send_admin_dashboard(ctx, uid)
+        return
+    if data == "admin:tests":
+        if uid not in ADMIN_IDS:
+            await q.answer("Full admins only.", show_alert=True); return
+        await send_weekly_test_admin_panel(ctx, uid); return
+    if data.startswith("admin:tests:release:"):
+        if uid not in ADMIN_IDS:
+            await q.answer("Full admins only.", show_alert=True); return
+        week = int(data.rsplit(":", 1)[1])
+        sent, closes = await release_weekly_test(ctx, uid, week)
+        await q.message.reply_text(
+            f"✅ Week {week} test released immediately.\nEligible students notified: {sent}\nCloses: {closes.strftime('%a, %d %b %Y %I:%M %p')} Nigeria time.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Weekly Tests", callback_data="admin:tests")]])
+        )
+        return
+    if data.startswith("admin:tests:results:"):
+        if uid not in ADMIN_IDS:
+            await q.answer("Full admins only.", show_alert=True); return
+        week = int(data.rsplit(":", 1)[1])
+        with db() as c:
+            row = c.execute(
+                "SELECT COUNT(DISTINCT user_id) started, COUNT(DISTINCT user_id) FILTER (WHERE passed=TRUE) passed, COUNT(*) attempts, COALESCE(AVG(percentage),0) avg_pct FROM weekly_test_attempts WHERE cohort=? AND week_number=?",
+                (active_cohort(), week),
+            ).fetchone()
+        await q.message.reply_text(
+            f"📊 WEEK {week} TEST RESULTS — {active_cohort()}\n\nStudents started: {row['started']}\nStudents passed: {row['passed']}\nTotal attempts: {row['attempts']}\nAverage attempt score: {float(row['avg_pct'] or 0):.1f}%",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Weekly Tests", callback_data="admin:tests")]])
+        )
         return
     if data == "admin:stats":
         with db() as c:
@@ -2666,6 +3250,18 @@ async def complete_cmd(update, ctx):
         return
     uid = s["user_id"]
 
+    # New certificates require all four weekly knowledge tests. Existing issued
+    # certificates remain permanent and are never invalidated by this new rule.
+    if not (s.get("certificate_issued_at") and s.get("certificate_number")):
+        missing_tests = missing_weekly_tests(uid)
+        if missing_tests:
+            await update.message.reply_text(
+                f"Certificate not ready for {s['name']} ({s['student_no']}). Missing weekly test pass(es): "
+                + ", ".join(f"Week {w}" for w in missing_tests)
+                + ". Complete the weekly tests plus the Academy's project/oral-defense requirements before issuing the certificate."
+            )
+            return
+
     # Certificates are permanent documents. Re-running /complete must never
     # replace the original issue date or certificate number.
     existing_issued_at = s.get("certificate_issued_at")
@@ -2784,6 +3380,7 @@ def build_telegram_application():
     app.add_handler(CommandHandler("status", status_cmd))
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CallbackQueryHandler(account_callback, pattern=r"^(profile:|recover:).+"))
+    app.add_handler(CallbackQueryHandler(weekly_test_callback, pattern=r"^(test:|project:).+"))
     app.add_handler(CallbackQueryHandler(menu_callback, pattern=r"^(menu:|rules:|faq:|faqanswer:|assignment:).+"))
     app.add_handler(CallbackQueryHandler(admin_dashboard_callback, pattern=r"^admin:"))
     app.add_handler(CallbackQueryHandler(review_open_callback, pattern=r"^reviewopen:\d+$"))
@@ -2806,6 +3403,7 @@ def build_telegram_application():
     app.job_queue.run_daily(scheduled_group_morning, time=_parse_hhmm(GROUP_MORNING_TIME, "08:00"))
     app.job_queue.run_daily(scheduled_group_reminder, time=_parse_hhmm(GROUP_REMINDER_TIME, "17:00"))
     app.job_queue.run_repeating(check_admin_class_reminders, interval=60, first=15)
+    app.job_queue.run_repeating(scheduled_expired_test_check, interval=30, first=20)
     app.add_error_handler(telegram_error_handler)
     return app
 
@@ -2878,11 +3476,13 @@ async def reminder_check(request: Request):
 
     ctx = _Ctx()
     await check_admin_class_reminders(ctx)
+    expired_tests_submitted = await finalize_expired_test_attempts(ctx)
     morning_sent = await _send_group_schedule_once(ctx, "morning", GROUP_MORNING_TIME, require_due_window=True)
     reminder_sent = await _send_group_schedule_once(ctx, "reminder", GROUP_REMINDER_TIME, require_due_window=True)
     return {
         "ok": True,
         "checked_at": now().isoformat(),
+        "expired_tests_submitted": expired_tests_submitted,
         "morning_sent": morning_sent,
         "class_group_reminder_sent": reminder_sent,
     }
