@@ -367,10 +367,10 @@ def audit_log(actor_user_id, action, target_type="", target_id="", details="", s
 
 # ---------- weekly knowledge tests ----------
 def has_course_access(student):
-    """Paid, referral-bonus, or complimentary access unlocks paid-course features."""
+    """Paid or explicitly granted complimentary/referral access unlocks paid-course features."""
     if not student:
         return False
-    return bool(student.get("status") == "paid" or student.get("free_access") or student.get("bonus_sent"))
+    return bool(student.get("status") == "paid" or student.get("free_access"))
 
 
 def get_open_test_release(week_number=None, cohort=None):
@@ -841,7 +841,7 @@ async def release_weekly_test(ctx, admin_uid, week_number):
             (cohort, int(week_number), released.isoformat(), closes.isoformat(), admin_uid),
         )
         students = c.execute(
-            "SELECT user_id FROM students WHERE COALESCE(archived,FALSE)=FALSE AND cohort=? AND (status='paid' OR COALESCE(free_access,FALSE)=TRUE OR COALESCE(bonus_sent,FALSE)=TRUE)",
+            "SELECT user_id FROM students WHERE COALESCE(archived,FALSE)=FALSE AND cohort=? AND (status='paid' OR COALESCE(free_access,FALSE)=TRUE)",
             (cohort,),
         ).fetchall()
     sent = 0
@@ -1122,10 +1122,33 @@ def _message_for(kind, dt=None):
 
 
 def referral_count(student_no):
+    """Total registrations attributed to a referrer (informational only)."""
     with db() as c:
         return c.execute(
-            "SELECT COUNT(*) n FROM students WHERE referred_by ILIKE ?",
+            """SELECT COUNT(*) n FROM students
+               WHERE referred_by ILIKE ? AND COALESCE(archived,FALSE)=FALSE""",
             (student_no,),
+        ).fetchone()["n"]
+
+
+def paid_referral_count(student_no):
+    """Count only referrals whose real payments were approved up to the full course fee.
+
+    This deliberately uses the payments table rather than access/status flags, so
+    complimentary access and referral bonuses can never masquerade as paid referrals.
+    """
+    with db() as c:
+        return c.execute(
+            """SELECT COUNT(*) n
+               FROM students s
+               WHERE s.referred_by ILIKE ?
+                 AND COALESCE(s.archived,FALSE)=FALSE
+                 AND (
+                     SELECT COALESCE(SUM(p.amount),0)
+                     FROM payments p
+                     WHERE p.user_id=s.user_id AND p.status='approved'
+                 ) >= ?""",
+            (student_no, PRICE_FULL),
         ).fetchone()["n"]
 
 
@@ -1319,51 +1342,81 @@ async def got_category(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     # Mandatory gate: ID, curriculum and crash-course link are withheld until rules acceptance.
     await send_rules_page(ctx, u.id, 0)
 
-    if referred_by:
-        await maybe_send_referral_bonus(ctx, referred_by)
-
+    # A referral is recorded at registration, but it does NOT count toward the
+    # reward until that referred student becomes fully paid after admin-approved payment.
     return ConversationHandler.END
 
 
-async def maybe_send_referral_bonus(ctx, referrer_no):
+async def maybe_send_referral_bonus(ctx, referrer_no, actor_user_id=None):
+    """Grant referral access only after enough referred students are fully paid.
+
+    Important: registrations alone never qualify. Complimentary/free-access students
+    also do not count because paid_referral_count requires real confirmed payment.
+    """
     referrer = get_student_by_no(referrer_no)
     if not referrer or referrer["bonus_sent"]:
         return
-    count = referral_count(referrer_no)
+
+    count = paid_referral_count(referrer_no)
     if count < REFERRAL_BONUS_THRESHOLD:
         return
 
-    # first time this referrer crosses the threshold — decide now, once,
-    # whether a free-access slot is still available
+    # Only actual referral free-access grants consume the limited slots.
     with db() as c:
         granted_so_far = c.execute(
-            "SELECT COUNT(*) n FROM students WHERE bonus_sent=TRUE"
+            "SELECT COUNT(*) n FROM students WHERE bonus_sent=TRUE AND COALESCE(free_access,FALSE)=TRUE"
         ).fetchone()["n"]
 
     if granted_so_far < REFERRAL_FREE_ACCESS_CAP:
         with db() as c:
             c.execute(
-                "UPDATE students SET bonus_sent=TRUE, status='paid', paid_amount=?, second_due=NULL WHERE student_no=?",
-                (PRICE_FULL, referrer_no),
+                """UPDATE students
+                   SET bonus_sent=TRUE, free_access=TRUE, second_due=NULL
+                   WHERE student_no=?""",
+                (referrer_no,),
             )
+        try:
+            audit_log(
+                actor_user_id or 0,
+                "referral_free_access_granted",
+                "student",
+                referrer_no,
+                f"qualified_paid_referrals={count}",
+                student_user_id=referrer["user_id"],
+            )
+        except Exception:
+            pass
         msg = (
-            f"🎉 Amazing — you've referred {count} people! That earns you FREE full access "
-            f"to the {PROGRAM}, no payment needed. Please open the rules and accept them "
-            "to receive class access."
+            f"🎉 Amazing — {count} people you referred have now completed and had their payments approved. "
+            f"You have earned FREE full access to the {PROGRAM}. No payment is required from you. "
+            "Please open My Classes to continue."
         )
         try:
             await ctx.bot.send_message(referrer["user_id"], msg)
+            if rules_accepted(referrer["user_id"]):
+                await deliver_class_access(ctx, referrer["user_id"])
         except Exception as e:
-            log.warning("Could not notify %s of free access: %s", referrer["user_id"], e)
+            log.warning("Could not notify %s of referral free access: %s", referrer["user_id"], e)
     else:
+        # Mark notification as handled, but do NOT grant access.
         with db() as c:
             c.execute("UPDATE students SET bonus_sent=TRUE WHERE student_no=?", (referrer_no,))
         try:
+            audit_log(
+                actor_user_id or 0,
+                "referral_threshold_reached_cap_full",
+                "student",
+                referrer_no,
+                f"qualified_paid_referrals={count}",
+                student_user_id=referrer["user_id"],
+            )
+        except Exception:
+            pass
+        try:
             await ctx.bot.send_message(
                 referrer["user_id"],
-                f"You've referred {count} people — thank you so much for spreading the word! "
-                f"All {REFERRAL_FREE_ACCESS_CAP} free-access slots have already been claimed by "
-                "earlier referrers, but we really appreciate you.",
+                f"You now have {count} fully paid referrals — thank you for spreading the word. "
+                f"All {REFERRAL_FREE_ACCESS_CAP} referral free-access slots have already been claimed by earlier qualifiers.",
             )
         except Exception as e:
             log.warning("Could not notify %s of referral cap: %s", referrer["user_id"], e)
@@ -1572,6 +1625,12 @@ async def review_payment(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if rules_accepted(p["user_id"]):
         await deliver_class_access(ctx, p["user_id"])
 
+    # Referral rewards are evaluated only after admin-approved FULL payment.
+    # Registration, pending payment, rejected payment, part payment and complimentary
+    # access do not count toward the threshold.
+    if status == "paid" and s.get("referred_by"):
+        await maybe_send_referral_bonus(ctx, s["referred_by"], q.from_user.id)
+
 
 async def status_cmd(update, ctx):
     s = get_student(update.effective_user.id)
@@ -1640,31 +1699,32 @@ async def refer_cmd(update, ctx):
     if not s:
         await update.message.reply_text("You're not registered yet. Send /start.")
         return
-    count = referral_count(s["student_no"])
-    remaining = max(0, REFERRAL_BONUS_THRESHOLD - count)
+    registered_count = referral_count(s["student_no"])
+    paid_count = paid_referral_count(s["student_no"])
+    remaining = max(0, REFERRAL_BONUS_THRESHOLD - paid_count)
     if not BOT_USERNAME:
         await update.message.reply_text(
-            "Your referral tracking is set up, but the bot's link isn't configured yet — "
-            "let the team know."
+            "Your referral tracking is set up, but the bot's link isn't configured yet — let the team know."
         )
         return
     link = f"https://t.me/{BOT_USERNAME}?start=ref_{s['student_no']}"
     lines = [
         f"🔗 Your personal referral link:\n{link}",
         "",
-        "Share it with friends — when someone registers through it, it counts as your referral.",
+        "A referral qualifies only after the person registers through your link, completes full payment, and the payment is approved by Heribhee Academy.",
         "",
-        f"You've referred {count} so far.",
+        f"Registrations through your link: {registered_count}",
+        f"Fully paid referrals: {paid_count}",
     ]
-    if s["bonus_sent"]:
-        if s["status"] == "paid" and s["paid_amount"] >= PRICE_FULL:
-            lines.append("🎉 You've already unlocked FREE full access. Thank you for spreading the word!")
-        else:
-            lines.append("You crossed the referral threshold, but all free-access slots were already taken. Thank you regardless!")
+    if s.get("free_access") and s.get("bonus_sent"):
+        lines.append("🎉 You've already unlocked FREE full access through the referral programme.")
+    elif s.get("bonus_sent"):
+        lines.append("You reached the paid-referral threshold, but the available referral free-access slots had already been filled.")
     else:
         lines.append(
-            f"Refer {remaining} more (at {REFERRAL_BONUS_THRESHOLD} total) to unlock FREE full "
-            f"access — limited to the first {REFERRAL_FREE_ACCESS_CAP} people who qualify."
+            f"You need {remaining} more fully paid referral{'s' if remaining != 1 else ''} "
+            f"to unlock FREE full access ({REFERRAL_BONUS_THRESHOLD} total required). "
+            f"Limited to the first {REFERRAL_FREE_ACCESS_CAP} people who qualify."
         )
     await update.message.reply_text("\n".join(lines))
 
@@ -1672,18 +1732,24 @@ async def refer_cmd(update, ctx):
 async def leaderboard_cmd(update, ctx):
     with db() as c:
         rows = c.execute(
-            """SELECT referred_by, COUNT(*) n FROM students
-               WHERE referred_by IS NOT NULL AND referred_by != ''
-               GROUP BY referred_by ORDER BY n DESC LIMIT 10"""
+            """SELECT referred_by,
+                      COUNT(*) AS registered_n,
+                      SUM(CASE WHEN (SELECT COALESCE(SUM(p.amount),0) FROM payments p WHERE p.user_id=students.user_id AND p.status='approved') >= ? THEN 1 ELSE 0 END) AS paid_n
+               FROM students
+               WHERE referred_by IS NOT NULL AND referred_by != '' AND COALESCE(archived,FALSE)=FALSE
+               GROUP BY referred_by
+               ORDER BY paid_n DESC, registered_n DESC
+               LIMIT 10""",
+            (PRICE_FULL,),
         ).fetchall()
     if not rows:
         await update.message.reply_text("No referrals yet — be the first! Use /refer to get your link.")
         return
-    lines = ["🏆 Referral leaderboard:", ""]
+    lines = ["🏆 Referral leaderboard (ranked by fully paid referrals):", ""]
     for i, r in enumerate(rows, 1):
         ref = get_student_by_no(r["referred_by"])
         name = ref["name"] if ref else r["referred_by"]
-        lines.append(f"{i}. {name} — {r['n']} referral{'s' if r['n'] != 1 else ''}")
+        lines.append(f"{i}. {name} — {int(r['paid_n'] or 0)} paid / {r['registered_n']} registered")
     await update.message.reply_text("\n".join(lines))
 
 
@@ -1718,7 +1784,7 @@ FAQS = {
     ]),
     "payment": ("Payments & Referrals", [
         ("How do I check payment status?", "Choose Payment & Status from the menu or use /status."),
-        ("How do referrals work?", "Open Refer a Friend to get your personal link and referral count. Referral free access is subject to the published threshold and available slots."),
+        ("How do referrals work?", "Open Refer a Friend to get your personal link. A referral counts toward free-access qualification only after the referred student completes full payment and that payment is approved. The reward remains subject to the published threshold and available slots."),
     ]),
     "rules": ("Rules & Conduct", [
         ("What happens for abusive language?", "Potential abuse is sent privately to an Academy admin for review. Removal occurs only after an authorized admin confirms the violation."),
@@ -1871,7 +1937,7 @@ def academy_assistant_answer(question, student=None):
             "An authorized reviewer can score it and send feedback privately through the bot."
         )
     if any(k in q for k in ("class link", "my class", "paid class", "crash course", "class access", "access class")):
-        if student and (student.get("status") == "paid" or student.get("free_access") or student.get("bonus_sent")):
+        if student and (student.get("status") == "paid" or student.get("free_access")):
             return "Your main class access is unlocked. Open My Classes and use the Join Paid Class button."
         return (
             "After registration and rules acceptance, My Classes gives you the free crash-course access. The separate main class appears after approved payment or complimentary/free access is granted by a full admin."
@@ -1892,7 +1958,7 @@ def academy_assistant_answer(question, student=None):
         )
     if any(k in q for k in ("free access", "complimentary", "referral", "refer", "friend")):
         return (
-            "Open Refer a Friend to get your personal referral link and see your referral count. Complimentary paid-class access can also be granted directly by a full admin. "
+            "Open Refer a Friend to get your personal referral link. Registrations can be tracked, but only fully paid referrals with admin-approved payments count toward the referral free-access threshold. Complimentary paid-class access can also be granted directly by a full admin. "
             "If complimentary access has been granted, My Classes will show the paid-class link without changing your recorded payment amount."
         )
     if any(k in q for k in ("help", "how bot", "how does", "menu", "button", "manual", "what can")):
@@ -2107,10 +2173,16 @@ async def menu_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if data == "menu:refer":
         s=get_student(uid)
         if not s: await q.message.reply_text("Please register first with /start."); return
-        count=referral_count(s["student_no"]); remaining=max(0,REFERRAL_BONUS_THRESHOLD-count)
+        registered_count=referral_count(s["student_no"]); paid_count=paid_referral_count(s["student_no"]); remaining=max(0,REFERRAL_BONUS_THRESHOLD-paid_count)
         if not BOT_USERNAME: await q.message.reply_text("Referral link is not configured yet."); return
         link=f"https://t.me/{BOT_USERNAME}?start=ref_{s['student_no']}"
-        await q.message.reply_text(f"Your referral link:\n{link}\n\nReferrals: {count}. Remaining to threshold: {remaining}."); return
+        await q.message.reply_text(
+            f"Your referral link:\n{link}\n\n"
+            f"Registrations through your link: {registered_count}\n"
+            f"Fully paid referrals: {paid_count}\n"
+            f"Remaining paid referrals to threshold: {remaining}\n\n"
+            "Only referred students who complete full payment and have that payment approved count toward free access."
+        ); return
     if data == "menu:cert":
         s=get_student(uid)
         if not s: await q.message.reply_text("Please register first with /start."); return
@@ -2152,7 +2224,7 @@ async def deliver_class_access(ctx, uid):
         await ctx.bot.send_message(uid, "Please register first using /start."); return
     if not rules_accepted(uid):
         await send_rules_page(ctx, uid, 0); return
-    if s["status"] != "paid" and not s["bonus_sent"] and not s.get("free_access"):
+    if s["status"] != "paid" and not s.get("free_access"):
         # Before payment, My Classes should simply take students back to the free
         # crash-course group. Payment instructions are shown only when they
         # deliberately open Payment & Status / the payment flow.
@@ -3420,14 +3492,19 @@ async def admin_dashboard_callback(update, ctx):
         await q.message.reply_text("PAYMENTS\n\n"+("\n".join(lines) if lines else "No payment records yet."),reply_markup=InlineKeyboardMarkup(kb)); return
     if data == "admin:referrals":
         with db() as c:
-            rows=c.execute("""SELECT referred_by,COUNT(*) n FROM students
-                              WHERE referred_by IS NOT NULL AND referred_by!=''
-                              GROUP BY referred_by ORDER BY n DESC LIMIT 30""").fetchall()
+            rows=c.execute("""SELECT referred_by,
+                                     COUNT(*) AS registered_n,
+                                     SUM(CASE WHEN (SELECT COALESCE(SUM(p.amount),0) FROM payments p WHERE p.user_id=students.user_id AND p.status='approved') >= ? THEN 1 ELSE 0 END) AS paid_n
+                              FROM students
+                              WHERE referred_by IS NOT NULL AND referred_by!='' AND COALESCE(archived,FALSE)=FALSE
+                              GROUP BY referred_by
+                              ORDER BY paid_n DESC, registered_n DESC
+                              LIMIT 30""",(PRICE_FULL,)).fetchall()
         lines=[]
         for r in rows:
             ref=get_student_by_no(r['referred_by'])
-            lines.append(f"{ref['name'] if ref else r['referred_by']} ({r['referred_by']}) — {r['n']} referral(s)")
-        await q.message.reply_text("REFERRALS\n\n"+("\n".join(lines) if lines else "No referrals yet."),reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Admin dashboard",callback_data="admin:home")]])); return
+            lines.append(f"{ref['name'] if ref else r['referred_by']} ({r['referred_by']}) — {int(r['paid_n'] or 0)} paid / {r['registered_n']} registered")
+        await q.message.reply_text("REFERRALS — PAID QUALIFICATION\n\n"+("\n".join(lines) if lines else "No referrals yet."),reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Admin dashboard",callback_data="admin:home")]])); return
     if data.startswith("admin:support:"):
         offset=int(data.rsplit(":",1)[1])
         with db() as c:
