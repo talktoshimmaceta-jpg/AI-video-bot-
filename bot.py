@@ -777,6 +777,72 @@ async def release_weekly_test(ctx, admin_uid, week_number):
     return sent, closes
 
 
+def revoke_weekly_test(admin_uid, week_number, clear_attempts=False):
+    """Close a released weekly test immediately.
+
+    clear_attempts=False preserves completed results and only closes the release.
+    clear_attempts=True is a test/clearance reset: it also removes all attempts
+    and answers for the active cohort/week so the week behaves as never tested.
+    """
+    cohort = active_cohort()
+    with db() as c:
+        c.execute(
+            "UPDATE weekly_test_releases SET is_active=FALSE, closes_at=NOW() WHERE cohort=? AND week_number=?",
+            (cohort, int(week_number)),
+        )
+        # Cancel any attempt that was still running so old inline buttons stop working.
+        c.execute(
+            "UPDATE weekly_test_attempts SET status='revoked', submitted_at=COALESCE(submitted_at,NOW()) "
+            "WHERE cohort=? AND week_number=? AND status='active'",
+            (cohort, int(week_number)),
+        )
+        removed = 0
+        if clear_attempts:
+            row = c.execute(
+                "SELECT COUNT(*) n FROM weekly_test_attempts WHERE cohort=? AND week_number=?",
+                (cohort, int(week_number)),
+            ).fetchone()
+            removed = int(row["n"] or 0)
+            # weekly_test_answers are ON DELETE CASCADE from attempts.
+            c.execute(
+                "DELETE FROM weekly_test_attempts WHERE cohort=? AND week_number=?",
+                (cohort, int(week_number)),
+            )
+            # Remove the release row too so the admin panel returns to Not released.
+            c.execute(
+                "DELETE FROM weekly_test_releases WHERE cohort=? AND week_number=?",
+                (cohort, int(week_number)),
+            )
+    action = "weekly_test_reset" if clear_attempts else "weekly_test_revoked"
+    audit_log(admin_uid, action, "weekly_test", f"week-{week_number}", f"cohort={cohort}; attempts_removed={removed}")
+    return removed
+
+
+def wipe_student_record(admin_uid, student_uid):
+    """Permanently remove a student and student-owned course data from the bot."""
+    student = get_student(int(student_uid))
+    if not student:
+        return None
+    snapshot = {
+        "user_id": int(student["user_id"]),
+        "name": student.get("name") or "Unknown",
+        "student_no": student.get("student_no") or "-",
+    }
+    with db() as c:
+        # These tables are explicitly cleared so a removed Telegram account can
+        # register again as a genuinely fresh student.
+        c.execute("DELETE FROM weekly_test_attempts WHERE user_id=?", (int(student_uid),))
+        c.execute("DELETE FROM moderation_reports WHERE user_id=?", (int(student_uid),))
+        c.execute("DELETE FROM support_tickets WHERE user_id=?", (int(student_uid),))
+        c.execute("DELETE FROM assignment_submissions WHERE user_id=?", (int(student_uid),))
+        c.execute("DELETE FROM payments WHERE user_id=?", (int(student_uid),))
+        c.execute("DELETE FROM students WHERE user_id=?", (int(student_uid),))
+    # Keep one admin-side audit event showing that a full admin intentionally
+    # performed the deletion; it contains no course answers or payment proof.
+    audit_log(admin_uid, "student_wiped", "student", snapshot["student_no"], f"name={snapshot['name']}; telegram={snapshot['user_id']}")
+    return snapshot
+
+
 async def send_weekly_test_admin_panel(ctx, uid):
     cohort = active_cohort()
     lines = ["🧠 WEEKLY KNOWLEDGE TESTS", f"Cohort: {cohort}", "", "Release a test immediately after that week's live session."]
@@ -794,8 +860,12 @@ async def send_weekly_test_admin_panel(ctx, uid):
             status = "Not released"
         lines.append(f"Week {week}: {status}")
         kb.append([
-            InlineKeyboardButton(f"🎙 Release Week {week}", callback_data=f"admin:tests:release:{week}"),
+            InlineKeyboardButton(f"🎙 Release W{week}", callback_data=f"admin:tests:release:{week}"),
+            InlineKeyboardButton(f"🚫 Revoke W{week}", callback_data=f"admin:tests:revoke:{week}"),
+        ])
+        kb.append([
             InlineKeyboardButton(f"📊 W{week} Results", callback_data=f"admin:tests:results:{week}"),
+            InlineKeyboardButton(f"🧹 Reset W{week}", callback_data=f"admin:tests:reset:{week}"),
         ])
     kb.append([InlineKeyboardButton("Admin dashboard", callback_data="admin:home")])
     await ctx.bot.send_message(uid, "\n".join(lines), reply_markup=InlineKeyboardMarkup(kb))
@@ -2228,6 +2298,33 @@ async def student_private_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE
         await send_admin_dashboard(ctx, uid)
         return
 
+    if uid in ADMIN_IDS and ctx.user_data.get("awaiting_student_wipe_search"):
+        query = (msg.text or "").strip()[:120]
+        if not query:
+            await msg.reply_text("Send the Student ID, for example HB-0001.")
+            return
+        st = get_student_by_no(query)
+        if not st:
+            try:
+                st = get_student(int(query))
+            except (ValueError, TypeError):
+                st = None
+        ctx.user_data.pop("awaiting_student_wipe_search", None)
+        if not st:
+            await msg.reply_text(
+                "No exact student was found. For safety, Student Clearance requires an exact Student ID or Telegram numeric ID.",
+                reply_markup=admin_dashboard_keyboard(),
+            )
+            return
+        await msg.reply_text(
+            f"🧹 STUDENT FOUND\n\nName: {st.get('name') or '-'}\nStudent ID: {st.get('student_no') or '-'}\nStatus: {st.get('status') or '-'}\nPhone: {st.get('phone') or '-'}\nEmail: {st.get('email') or '-'}\nTelegram: {st.get('user_id')}\n\nDo you want to begin permanent clearance for this student?",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("Continue to wipe", callback_data=f"admin:wipe:confirm:{st['user_id']}")],
+                [InlineKeyboardButton("Cancel", callback_data="admin:home")],
+            ])
+        )
+        return
+
     if uid in REVIEWER_IDS and ctx.user_data.get("awaiting_student_search"):
         query = (msg.text or "").strip()[:120]
         if not query:
@@ -2679,7 +2776,8 @@ def admin_dashboard_keyboard():
         [InlineKeyboardButton("📣 Group Messages", callback_data="admin:groupmsg"), InlineKeyboardButton("📄 Export PDF", callback_data="admin:export")],
         [InlineKeyboardButton("📊 Statistics", callback_data="admin:stats"), InlineKeyboardButton("🎁 Free Access", callback_data="admin:freeaccess")],
         [InlineKeyboardButton("⏰ Class Reminders", callback_data="admin:classreminders"), InlineKeyboardButton("🧠 Weekly Tests", callback_data="admin:tests")],
-        [InlineKeyboardButton("🆔 Show my Telegram ID", callback_data="admin:myid"), InlineKeyboardButton("📖 Admin Manual", callback_data="admin:manual")],
+        [InlineKeyboardButton("🧹 Student Clearance", callback_data="admin:clearance"), InlineKeyboardButton("🆔 Show my Telegram ID", callback_data="admin:myid")],
+        [InlineKeyboardButton("📖 Admin Manual", callback_data="admin:manual")],
     ])
 
 
@@ -2889,6 +2987,50 @@ async def admin_dashboard_callback(update, ctx):
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Weekly Tests", callback_data="admin:tests")]])
         )
         return
+    if data.startswith("admin:tests:revoke_confirm:"):
+        if uid not in ADMIN_IDS:
+            await q.answer("Full admins only.", show_alert=True); return
+        week = int(data.rsplit(":", 1)[1])
+        revoke_weekly_test(uid, week, clear_attempts=False)
+        await q.message.reply_text(
+            f"🚫 Week {week} test has been revoked. It is hidden immediately and no new attempt can start. Existing completed results were preserved.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Weekly Tests", callback_data="admin:tests")]])
+        )
+        return
+    if data.startswith("admin:tests:revoke:"):
+        if uid not in ADMIN_IDS:
+            await q.answer("Full admins only.", show_alert=True); return
+        week = int(data.rsplit(":", 1)[1])
+        await q.message.reply_text(
+            f"Revoke Week {week} now?\n\nThis hides the test immediately and cancels any active attempt. Completed scores/results are NOT erased.",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🚫 YES, REVOKE", callback_data=f"admin:tests:revoke_confirm:{week}")],
+                [InlineKeyboardButton("Cancel", callback_data="admin:tests")],
+            ])
+        )
+        return
+    if data.startswith("admin:tests:reset_confirm:"):
+        if uid not in ADMIN_IDS:
+            await q.answer("Full admins only.", show_alert=True); return
+        week = int(data.rsplit(":", 1)[1])
+        removed = revoke_weekly_test(uid, week, clear_attempts=True)
+        await q.message.reply_text(
+            f"🧹 Week {week} has been fully reset for {active_cohort()}.\n\nRemoved attempts: {removed}\nStatus is back to Not released. You can release it again later as a clean test.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Weekly Tests", callback_data="admin:tests")]])
+        )
+        return
+    if data.startswith("admin:tests:reset:"):
+        if uid not in ADMIN_IDS:
+            await q.answer("Full admins only.", show_alert=True); return
+        week = int(data.rsplit(":", 1)[1])
+        await q.message.reply_text(
+            f"⚠️ FULL RESET WEEK {week}\n\nThis is for testing/clearance. It will revoke Week {week} AND permanently erase every student's Week {week} attempts, answers and results for {active_cohort()}.\n\nUse Revoke instead if you only want to close the test.",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🧹 YES, RESET EVERYTHING", callback_data=f"admin:tests:reset_confirm:{week}")],
+                [InlineKeyboardButton("Cancel", callback_data="admin:tests")],
+            ])
+        )
+        return
     if data.startswith("admin:tests:results:"):
         if uid not in ADMIN_IDS:
             await q.answer("Full admins only.", show_alert=True); return
@@ -2901,6 +3043,45 @@ async def admin_dashboard_callback(update, ctx):
         await q.message.reply_text(
             f"📊 WEEK {week} TEST RESULTS — {active_cohort()}\n\nStudents started: {row['started']}\nStudents passed: {row['passed']}\nTotal attempts: {row['attempts']}\nAverage attempt score: {float(row['avg_pct'] or 0):.1f}%",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Weekly Tests", callback_data="admin:tests")]])
+        )
+        return
+    if data == "admin:clearance":
+        if uid not in ADMIN_IDS:
+            await q.answer("Full admins only.", show_alert=True); return
+        ctx.user_data["awaiting_student_wipe_search"] = True
+        await q.message.reply_text(
+            "🧹 STUDENT CLEARANCE\n\nSend the exact Student ID (recommended, e.g. HB-0001) or the student's Telegram numeric ID.\n\nThe bot will show the record and ask for confirmation before anything is deleted.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Cancel", callback_data="admin:home")]])
+        )
+        return
+    if data.startswith("admin:wipe:cancel"):
+        ctx.user_data.pop("awaiting_student_wipe_search", None)
+        await send_admin_dashboard(ctx, uid); return
+    if data.startswith("admin:wipe:confirm:"):
+        if uid not in ADMIN_IDS:
+            await q.answer("Full admins only.", show_alert=True); return
+        target_uid = int(data.rsplit(":", 1)[1])
+        st = get_student(target_uid)
+        if not st:
+            await q.message.reply_text("That student record no longer exists.", reply_markup=admin_dashboard_keyboard()); return
+        await q.message.reply_text(
+            f"⚠️ FINAL CONFIRMATION\n\nDelete {st.get('name')} ({st.get('student_no')}) completely?\n\nThis removes registration, payment records, assignments, support tickets and weekly-test records. The person will be treated as a brand-new user if they start the bot again.\n\nThis cannot be undone.",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🗑 PERMANENTLY WIPE STUDENT", callback_data=f"admin:wipe:final:{target_uid}")],
+                [InlineKeyboardButton("Cancel", callback_data="admin:home")],
+            ])
+        )
+        return
+    if data.startswith("admin:wipe:final:"):
+        if uid not in ADMIN_IDS:
+            await q.answer("Full admins only.", show_alert=True); return
+        target_uid = int(data.rsplit(":", 1)[1])
+        snap = wipe_student_record(uid, target_uid)
+        if not snap:
+            await q.message.reply_text("That student record no longer exists.", reply_markup=admin_dashboard_keyboard()); return
+        await q.message.reply_text(
+            f"✅ Student wiped successfully.\n\n{snap['name']} ({snap['student_no']}) has been removed from the bot and can register again from scratch if needed.",
+            reply_markup=admin_dashboard_keyboard()
         )
         return
     if data == "admin:stats":
