@@ -1701,6 +1701,7 @@ async def refer_cmd(update, ctx):
         return
     registered_count = referral_count(s["student_no"])
     paid_count = paid_referral_count(s["student_no"])
+    pending_count = max(0, registered_count - paid_count)
     remaining = max(0, REFERRAL_BONUS_THRESHOLD - paid_count)
     if not BOT_USERNAME:
         await update.message.reply_text(
@@ -1711,10 +1712,10 @@ async def refer_cmd(update, ctx):
     lines = [
         f"🔗 Your personal referral link:\n{link}",
         "",
-        "A referral qualifies only after the person registers through your link, completes full payment, and the payment is approved by Heribhee Academy.",
+        f"👥 Total referrals: {registered_count}",
+        f"✅ Paid & approved: {paid_count}",
+        f"ℹ️ Pending payment/approval: {pending_count}",
         "",
-        f"Registrations through your link: {registered_count}",
-        f"Fully paid referrals: {paid_count}",
     ]
     if s.get("free_access") and s.get("bonus_sent"):
         lines.append("🎉 You've already unlocked FREE full access through the referral programme.")
@@ -1722,10 +1723,14 @@ async def refer_cmd(update, ctx):
         lines.append("You reached the paid-referral threshold, but the available referral free-access slots had already been filled.")
     else:
         lines.append(
-            f"You need {remaining} more fully paid referral{'s' if remaining != 1 else ''} "
+            f"You need {remaining} more paid and approved referral{'s' if remaining != 1 else ''} "
             f"to unlock FREE full access ({REFERRAL_BONUS_THRESHOLD} total required). "
             f"Limited to the first {REFERRAL_FREE_ACCESS_CAP} people who qualify."
         )
+        lines.extend([
+            "",
+            "ℹ️ Note: Free premium access remains pending until the required referrals complete full payment and their payments are approved by Heribhee Academy."
+        ])
     await update.message.reply_text("\n".join(lines))
 
 
@@ -2173,15 +2178,16 @@ async def menu_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if data == "menu:refer":
         s=get_student(uid)
         if not s: await q.message.reply_text("Please register first with /start."); return
-        registered_count=referral_count(s["student_no"]); paid_count=paid_referral_count(s["student_no"]); remaining=max(0,REFERRAL_BONUS_THRESHOLD-paid_count)
+        registered_count=referral_count(s["student_no"]); paid_count=paid_referral_count(s["student_no"]); pending_count=max(0,registered_count-paid_count); remaining=max(0,REFERRAL_BONUS_THRESHOLD-paid_count)
         if not BOT_USERNAME: await q.message.reply_text("Referral link is not configured yet."); return
         link=f"https://t.me/{BOT_USERNAME}?start=ref_{s['student_no']}"
         await q.message.reply_text(
-            f"Your referral link:\n{link}\n\n"
-            f"Registrations through your link: {registered_count}\n"
-            f"Fully paid referrals: {paid_count}\n"
-            f"Remaining paid referrals to threshold: {remaining}\n\n"
-            "Only referred students who complete full payment and have that payment approved count toward free access."
+            f"🔗 Your referral link:\n{link}\n\n"
+            f"👥 Total referrals: {registered_count}\n"
+            f"✅ Paid & approved: {paid_count}\n"
+            f"ℹ️ Pending payment/approval: {pending_count}\n"
+            f"Remaining to unlock free access: {remaining}\n\n"
+            "ℹ️ Note: Free premium access remains pending until the required referrals complete full payment and their payments are approved by Heribhee Academy."
         ); return
     if data == "menu:cert":
         s=get_student(uid)
