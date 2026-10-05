@@ -320,14 +320,45 @@ def active_cohort():
     return (get_app_setting("active_cohort", "Cohort 1") or "Cohort 1").strip()
 
 
-def audit_log(actor_user_id, action, target_type="", target_id="", details=""):
-    """Best-effort audit trail. Never break a user action if logging itself fails."""
+def remember_staff(user_id, display_name):
+    """Keep a friendly staff name so audit/history screens show people, not only Telegram IDs."""
+    if user_id not in REVIEWER_IDS:
+        return
     try:
-        actor_role = "full_admin" if actor_user_id in ADMIN_IDS else ("reviewer" if actor_user_id in REVIEWER_IDS else "student")
+        role = "full_admin" if user_id in ADMIN_IDS else "reviewer"
+        name = (display_name or str(user_id)).strip()[:160]
         with db() as c:
             c.execute(
-                "INSERT INTO audit_log(actor_user_id,actor_role,action,target_type,target_id,details,created_at) VALUES(?,?,?,?,?,?,NOW())",
-                (actor_user_id, actor_role, action[:120], target_type[:80], str(target_id)[:160], str(details)[:3000]),
+                "INSERT INTO staff_directory(user_id,display_name,role,last_seen_at) VALUES(?,?,?,NOW()) "
+                "ON CONFLICT (user_id) DO UPDATE SET display_name=EXCLUDED.display_name, role=EXCLUDED.role, last_seen_at=NOW()",
+                (int(user_id), name, role),
+            )
+    except Exception as e:
+        log.warning("Could not remember staff identity %s: %s", user_id, e)
+
+
+def staff_name(user_id):
+    if not user_id:
+        return "System"
+    try:
+        with db() as c:
+            row = c.execute("SELECT display_name FROM staff_directory WHERE user_id=?", (int(user_id),)).fetchone()
+        if row and row.get("display_name"):
+            return row["display_name"]
+    except Exception:
+        pass
+    return str(user_id)
+
+
+def audit_log(actor_user_id, action, target_type="", target_id="", details="", student_user_id=None):
+    """Append-only audit trail with staff-name snapshot and optional student linkage."""
+    try:
+        actor_role = "full_admin" if actor_user_id in ADMIN_IDS else ("reviewer" if actor_user_id in REVIEWER_IDS else "student")
+        actor_name = staff_name(actor_user_id) if actor_user_id in REVIEWER_IDS else ("Student" if actor_role == "student" else str(actor_user_id))
+        with db() as c:
+            c.execute(
+                "INSERT INTO audit_log(actor_user_id,actor_name,actor_role,action,target_type,target_id,student_user_id,details,created_at) VALUES(?,?,?,?,?,?,?,?,NOW())",
+                (actor_user_id, actor_name[:160], actor_role, action[:120], target_type[:80], str(target_id)[:160], student_user_id, str(details)[:3000]),
             )
     except Exception as e:
         log.warning("Audit log write failed for %s: %s", action, e)
@@ -534,6 +565,14 @@ def finalize_test_attempt(attempt_id, expired=False):
             "UPDATE weekly_test_attempts SET status=?,submitted_at=?,score=?,percentage=?,passed=?,retry_available_at=? WHERE id=?",
             ("expired" if expired else "submitted", submitted_at.isoformat(), score, pct, passed, retry_at.isoformat(), attempt_id),
         )
+    audit_log(
+        attempt["user_id"],
+        "weekly_test_completed",
+        "weekly_test",
+        f"week-{attempt['week_number']}",
+        f"attempt={attempt.get('attempt_number')}; score={score}/{total}; percentage={pct}; passed={passed}; expired={expired}",
+        student_user_id=attempt["user_id"],
+    )
     return get_attempt(attempt_id)
 
 
@@ -637,7 +676,7 @@ def start_test_attempt(uid, week_number):
             "VALUES(?,?,?,?,?,?,?,?,?::jsonb,?::jsonb,0) RETURNING *",
             (uid, student.get("cohort") or active_cohort(), int(week_number), attempt_number, started.isoformat(), expires.isoformat(), "active", count, json.dumps(question_order), json.dumps(option_orders)),
         ).fetchone()
-    audit_log(uid, "weekly_test_started", "weekly_test", f"week-{week_number}", f"attempt={attempt_number}")
+    audit_log(uid, "weekly_test_started", "weekly_test", f"week-{week_number}", f"attempt={attempt_number}", student_user_id=uid)
     return row, None
 
 
@@ -1504,7 +1543,7 @@ async def review_payment(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             return
         if action == "rj":
             c.execute("UPDATE payments SET status='rejected' WHERE id=?", (pid,))
-            audit_log(q.from_user.id, "payment_rejected", "payment", pid, f"user_id={p['user_id']}")
+            audit_log(q.from_user.id, "payment_rejected", "payment", pid, f"user_id={p['user_id']}", student_user_id=p["user_id"])
             await q.answer("Rejected")
             await q.edit_message_caption((q.message.caption or "") + "\n\nREJECTED")
             await ctx.bot.send_message(
@@ -1522,7 +1561,7 @@ async def review_payment(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             "UPDATE students SET paid_amount=?, status=?, second_due=? WHERE user_id=?",
             (paid, status, second_due, p["user_id"]),
         )
-    audit_log(q.from_user.id, "payment_approved", "payment", pid, f"user_id={p['user_id']}; amount={p['amount']}; status={status}")
+    audit_log(q.from_user.id, "payment_approved", "payment", pid, f"user_id={p['user_id']}; amount={p['amount']}; status={status}", student_user_id=p["user_id"])
     await q.answer("Approved")
     await q.edit_message_caption((q.message.caption or "") + "\n\nAPPROVED")
     if status == "paid":
@@ -2139,6 +2178,8 @@ async def deliver_class_access(ctx, uid):
 async def student_private_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     msg = update.effective_message
     uid = update.effective_user.id
+    if uid in REVIEWER_IDS:
+        remember_staff(uid, update.effective_user.full_name)
 
     # Recovery must work before this Telegram account is linked to a student.
     if ctx.user_data.get("awaiting_recovery_student_id"):
@@ -2172,7 +2213,7 @@ async def student_private_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE
         with db() as c:
             c.execute("UPDATE students SET user_id=?, username=? WHERE user_id=?", (uid, update.effective_user.username, old_uid))
             c.execute("UPDATE moderation_reports SET user_id=? WHERE user_id=?", (uid, old_uid))
-        audit_log(uid, "account_recovered", "student", s["student_no"], f"old_telegram_id={old_uid}; new_telegram_id={uid}")
+        audit_log(uid, "account_recovered", "student", s["student_no"], f"old_telegram_id={old_uid}; new_telegram_id={uid}", student_user_id=uid)
         ctx.user_data.clear()
         await msg.reply_text(f"✅ Account recovered successfully. Student ID {visible_student_no(s)} is now linked to this Telegram account.")
         if rules_accepted(uid):
@@ -2272,7 +2313,7 @@ async def student_private_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE
             return
         with db() as c:
             c.execute("UPDATE students SET free_access=TRUE WHERE user_id=?", (student["user_id"],))
-        audit_log(uid, "free_access_granted", "student", student["student_no"], student["name"])
+        audit_log(uid, "free_access_granted", "student", student["student_no"], student["name"], student_user_id=student["user_id"])
         ctx.user_data.pop("awaiting_free_access_student_id", None)
         await msg.reply_text(
             f"✅ Complimentary paid-class access granted to {student['name']} ({student['student_no']}).\n"
@@ -2331,7 +2372,7 @@ async def student_private_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE
                 (status, score, uid, now().isoformat(), feedback, sid),
             )
         ctx.user_data.pop("awaiting_review_feedback", None)
-        audit_log(uid, "assignment_reviewed", "assignment", sid, f"student={r['student_no']}; status={status}; score={score}; feedback={feedback[:500]}")
+        audit_log(uid, "assignment_reviewed", "assignment", sid, f"student={r['student_no']}; status={status}; score={score}; feedback={feedback[:500]}", student_user_id=r["user_id"])
         reviewer_name = update.effective_user.full_name or str(uid)
         if status == "approved":
             student_notice = f"✅ Your assignment '{r['assignment_key']}' has been reviewed and approved.\nScore: {score}/100"
@@ -2352,6 +2393,53 @@ async def student_private_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE
                 log.warning("Could not post review result to admin group: %s", e)
         await msg.reply_text("✅ Review recorded and the student has been notified.")
         await send_admin_dashboard(ctx, uid)
+        return
+
+    if uid in ADMIN_IDS and ctx.user_data.get("awaiting_student_history_search"):
+        query = (msg.text or "").strip().upper()[:80]
+        st = get_student_by_no(query)
+        ctx.user_data.pop("awaiting_student_history_search", None)
+        if not st:
+            await msg.reply_text("No exact student was found. Please use the Student ID shown in the bot.", reply_markup=admin_dashboard_keyboard())
+            return
+        with db() as c:
+            events = c.execute(
+                """SELECT actor_user_id,actor_name,actor_role,action,target_type,target_id,details,created_at
+                   FROM audit_log WHERE student_user_id=? ORDER BY created_at DESC LIMIT 30""",
+                (int(st["user_id"]),),
+            ).fetchall()
+            reviews = c.execute(
+                """SELECT assignment_key,review_status,score,reviewed_by,reviewed_at,review_note
+                   FROM assignment_submissions WHERE user_id=? AND reviewed_at IS NOT NULL
+                   ORDER BY reviewed_at DESC LIMIT 15""",
+                (int(st["user_id"]),),
+            ).fetchall()
+        reg = str(st.get("registered_at") or "-")[:16].replace("T", " ")
+        lines = [
+            f"🕘 STUDENT HISTORY — {visible_student_no(st)}",
+            f"Name: {st.get('name') or '-'}",
+            f"Registered: {reg}",
+            f"Cohort: {st.get('cohort') or '-'}",
+            "",
+        ]
+        if reviews:
+            lines.append("ASSIGNMENT REVIEWS")
+            for r in reviews:
+                who = staff_name(r.get("reviewed_by"))
+                when = str(r.get("reviewed_at") or "-")[:16].replace("T", " ")
+                score = f" | {r['score']}/100" if r.get("score") is not None else ""
+                lines.append(f"• {when} — {r.get('assignment_key') or 'Assignment'} — {str(r.get('review_status') or '').replace('_',' ').title()}{score} — by {who}")
+            lines.append("")
+        lines.append("ACTIVITY HISTORY")
+        if not events:
+            lines.append("No linked activity events recorded yet. New admin/reviewer actions will appear here automatically.")
+        else:
+            for r in events:
+                who = r.get("actor_name") or staff_name(r.get("actor_user_id"))
+                when = str(r.get("created_at") or "-")[:16].replace("T", " ")
+                detail = (r.get("details") or "").replace("\n", " ")[:180]
+                lines.append(f"• {when} — {r.get('action') or '-'} — by {who}{(' — '+detail) if detail else ''}")
+        await msg.reply_text("\n".join(lines), reply_markup=admin_dashboard_keyboard())
         return
 
     if uid in ADMIN_IDS and ctx.user_data.get("awaiting_student_wipe_search"):
@@ -2389,10 +2477,10 @@ async def student_private_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE
         like = f"%{query}%"
         with db() as c:
             rows = c.execute(
-                """SELECT name,student_no,display_student_no,phone,email,occupation,category,status,cohort,archived,user_id
+                """SELECT name,student_no,display_student_no,phone,email,occupation,category,status,cohort,archived,user_id,registered_at
                    FROM students
                    WHERE student_no ILIKE ? OR display_student_no ILIKE ? OR name ILIKE ? OR phone ILIKE ? OR email ILIKE ?
-                   ORDER BY archived,name LIMIT 10""",
+                   ORDER BY archived, COALESCE(CAST(NULLIF(REGEXP_REPLACE(COALESCE(display_student_no,student_no),'[^0-9]','','g'),'') AS INTEGER),999999), registered_at LIMIT 10""",
                 (like, like, like, like, like),
             ).fetchall()
         ctx.user_data.pop("awaiting_student_search", None)
@@ -2403,9 +2491,9 @@ async def student_private_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE
         for r in rows:
             archive_tag = " [ARCHIVED]" if r.get("archived") else ""
             if uid in ADMIN_IDS:
-                lines.append(f"{r['name']} — {visible_student_no(r)}{archive_tag}\nStatus: {r.get('status') or '-'} | Cohort: {r.get('cohort') or '-'}\nPhone: {r.get('phone') or '-'} | Email: {r.get('email') or '-'}\nTelegram: {r.get('user_id')}")
+                lines.append(f"{visible_student_no(r)} — {r['name']}{archive_tag}\nRegistered: {str(r.get('registered_at') or '-')[:16].replace('T',' ')}\nStatus: {r.get('status') or '-'} | Cohort: {r.get('cohort') or '-'}\nPhone: {r.get('phone') or '-'} | Email: {r.get('email') or '-'}\nTelegram: {r.get('user_id')}")
             else:
-                lines.append(f"{r['name']} — {visible_student_no(r)}{archive_tag}\nRole: {r.get('occupation') or r.get('category') or '-'}\nPhone: {r.get('phone') or '-'} | Email: {r.get('email') or '-'}")
+                lines.append(f"{visible_student_no(r)} — {r['name']}{archive_tag}\nRegistered: {str(r.get('registered_at') or '-')[:16].replace('T',' ')}\nRole: {r.get('occupation') or r.get('category') or '-'}\nPhone: {r.get('phone') or '-'} | Email: {r.get('email') or '-'}")
             lines.append("")
         await msg.reply_text("\n".join(lines), reply_markup=dashboard_keyboard_for(uid))
         return
@@ -2459,7 +2547,7 @@ async def student_private_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE
             return
         with db() as c:
             c.execute("UPDATE students SET name=?, name_edit_used=TRUE WHERE user_id=?", (new_name, uid))
-        audit_log(uid, "student_name_changed", "student", s["student_no"], f"new_name={new_name}")
+        audit_log(uid, "student_name_changed", "student", s["student_no"], f"new_name={new_name}", student_user_id=uid)
         ctx.user_data.pop("awaiting_profile_name", None)
         await msg.reply_text("✅ Your name has been updated. Your ID card will now use the new name.")
         await show_profile(ctx, uid)
@@ -2476,7 +2564,7 @@ async def student_private_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE
             return
         with db() as c:
             c.execute("UPDATE students SET occupation=?, occupation_edit_used=TRUE WHERE user_id=?", (new_role, uid))
-        audit_log(uid, "student_occupation_changed", "student", s["student_no"], f"new_role={new_role}")
+        audit_log(uid, "student_occupation_changed", "student", s["student_no"], f"new_role={new_role}", student_user_id=uid)
         ctx.user_data.pop("awaiting_profile_occupation", None)
         await msg.reply_text("✅ Your occupation/role has been updated. Your ID card will now use the new role.")
         await show_profile(ctx, uid)
@@ -2666,13 +2754,13 @@ def build_student_records_pdf(rows, include_sensitive=True):
                 access = "Registered"
             cert = r.get("certificate_number") or ("Eligible" if r.get("certificate_eligible") else "-")
             vals = [
-                r.get("student_no") or "-", r.get("name") or "-", r.get("phone") or "-",
+                visible_student_no(r), r.get("name") or "-", r.get("phone") or "-",
                 r.get("email") or "-", r.get("occupation") or r.get("category") or "-",
                 access, f"₦{int(r.get('paid_amount') or 0):,}", reg or "-", cert,
             ]
         else:
             vals = [
-                r.get("student_no") or "-", r.get("name") or "-", r.get("phone") or "-",
+                visible_student_no(r), r.get("name") or "-", r.get("phone") or "-",
                 r.get("email") or "-", r.get("occupation") or r.get("category") or "-", reg or "-",
             ]
         data.append([Paragraph(escape(str(v)), small) for v in vals])
@@ -2824,10 +2912,11 @@ async def send_admin_manual(ctx, uid):
 def admin_dashboard_keyboard():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("👨‍🎓 Students", callback_data="admin:students:0"), InlineKeyboardButton("🔎 Student Search", callback_data="admin:search")],
+        [InlineKeyboardButton("🕘 Student History", callback_data="admin:history"), InlineKeyboardButton("🧾 Audit Log", callback_data="admin:audit")],
         [InlineKeyboardButton("💳 Payments", callback_data="admin:payments:0"), InlineKeyboardButton("📝 Assignments", callback_data="admin:assignments")],
         [InlineKeyboardButton("✅ Pending reviews", callback_data="admin:pending:0"), InlineKeyboardButton("📈 Reviewer Performance", callback_data="admin:reviewerperf")],
         [InlineKeyboardButton("🎓 Certificates", callback_data="admin:certs"), InlineKeyboardButton("🗃 Cohorts / Archive", callback_data="admin:cohorts")],
-        [InlineKeyboardButton("👥 Referrals", callback_data="admin:referrals"), InlineKeyboardButton("🧾 Audit Log", callback_data="admin:audit")],
+        [InlineKeyboardButton("👥 Referrals", callback_data="admin:referrals")],
         [InlineKeyboardButton("💬 Support questions", callback_data="admin:support:0"), InlineKeyboardButton("📢 Message students", callback_data="admin:message")],
         [InlineKeyboardButton("📣 Group Messages", callback_data="admin:groupmsg"), InlineKeyboardButton("📄 Export PDF", callback_data="admin:export")],
         [InlineKeyboardButton("📊 Statistics", callback_data="admin:stats"), InlineKeyboardButton("🎁 Free Access", callback_data="admin:freeaccess")],
@@ -2863,6 +2952,8 @@ async def admin_dashboard_callback(update, ctx):
     q=update.callback_query
     uid=q.from_user.id
     data=q.data
+    if uid in REVIEWER_IDS:
+        remember_staff(uid, q.from_user.full_name)
     if uid not in REVIEWER_IDS:
         await q.answer("This admin function is not available to your account.", show_alert=True); return
     if uid not in ADMIN_IDS:
@@ -2889,6 +2980,15 @@ async def admin_dashboard_callback(update, ctx):
         ctx.user_data["awaiting_student_search"] = True
         await q.message.reply_text("🔎 STUDENT SEARCH\n\nSend a Student ID, student name, phone number, or email address.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Cancel", callback_data="admin:home")]]))
         return
+    if data == "admin:history":
+        if uid not in ADMIN_IDS:
+            await q.answer("Full admins only.", show_alert=True); return
+        ctx.user_data["awaiting_student_history_search"] = True
+        await q.message.reply_text(
+            "🕘 STUDENT HISTORY\n\nSend the exact Student ID, for example HB-003.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Cancel", callback_data="admin:home")]])
+        )
+        return
     if data in {"admin:myperformance", "admin:reviewerperf"}:
         if data == "admin:reviewerperf" and uid not in ADMIN_IDS:
             await q.answer("Full admins only.", show_alert=True); return
@@ -2908,7 +3008,7 @@ async def admin_dashboard_callback(update, ctx):
                        FROM assignment_submissions WHERE reviewed_by=?""",
                     (rid,),
                 ).fetchone()
-                lines.append(f"Reviewer {rid}")
+                lines.append(f"Reviewer: {staff_name(rid)} ({rid})")
                 lines.append(f"Reviewed: {row['total'] or 0} | Approved: {row['approved'] or 0} | Corrections: {row['corrections'] or 0}")
                 lines.append(f"Average score given: {row['avg_score'] if row['avg_score'] is not None else '-'} | Last review: {str(row['last_review'])[:16] if row['last_review'] else '-'}")
                 lines.append("")
@@ -2923,7 +3023,8 @@ async def admin_dashboard_callback(update, ctx):
         if not rows:
             lines.append("No audit entries yet.")
         for r in rows:
-            lines.append(f"{str(r['created_at'])[:16]} • {r['actor_role']} {r['actor_user_id']}\n{r['action']} → {r.get('target_type') or '-'} {r.get('target_id') or ''}\n{(r.get('details') or '')[:140]}")
+            who = r.get("actor_name") or staff_name(r.get("actor_user_id"))
+            lines.append(f"{str(r['created_at'])[:16]} • {r['actor_role']} — {who} ({r['actor_user_id']})\n{r['action']} → {r.get('target_type') or '-'} {r.get('target_id') or ''}\n{(r.get('details') or '')[:140]}")
             lines.append("")
         await q.message.reply_text("\n".join(lines), reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Admin dashboard", callback_data="admin:home")]]))
         return
@@ -3156,7 +3257,8 @@ async def admin_dashboard_callback(update, ctx):
         await q.message.reply_text(f"ACADEMY SNAPSHOT\nStudents: {total}\nFully paid: {paid}\nComplimentary access: {free_access}\nConfirmed revenue: ₦{revenue:,}\nAssignment submissions: {subs}\nPending reviews: {pending}",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Admin dashboard",callback_data="admin:home")]])); return
     if data == "admin:export":
         with db() as c:
-            rows=c.execute("SELECT * FROM students WHERE COALESCE(archived,FALSE)=FALSE ORDER BY student_no").fetchall()
+            rows=c.execute("""SELECT * FROM students WHERE COALESCE(archived,FALSE)=FALSE
+                              ORDER BY COALESCE(CAST(NULLIF(REGEXP_REPLACE(COALESCE(display_student_no,student_no),'[^0-9]','','g'),'') AS INTEGER),999999), registered_at""").fetchall()
         out=build_student_records_pdf(rows, include_sensitive=(uid in ADMIN_IDS))
         caption = ("📄 Heribhee Studio student records - full admin export" if uid in ADMIN_IDS
                    else "📄 Heribhee Studio student records - reviewer export")
@@ -3357,11 +3459,14 @@ async def admin_dashboard_callback(update, ctx):
     if data.startswith("admin:students:"):
         offset=int(data.rsplit(":",1)[1])
         with db() as c:
-            rows=c.execute("SELECT name,student_no,display_student_no,status,user_id,phone,email,occupation,category,cohort FROM students WHERE COALESCE(archived,FALSE)=FALSE ORDER BY name LIMIT 15 OFFSET ?",(offset,)).fetchall()
+            rows=c.execute("""SELECT name,student_no,display_student_no,status,user_id,phone,email,occupation,category,cohort,registered_at
+                              FROM students WHERE COALESCE(archived,FALSE)=FALSE
+                              ORDER BY COALESCE(CAST(NULLIF(REGEXP_REPLACE(COALESCE(display_student_no,student_no),'[^0-9]','','g'),'') AS INTEGER),999999), registered_at
+                              LIMIT 15 OFFSET ?""",(offset,)).fetchall()
         if uid in ADMIN_IDS:
-            lines=[f"{r['name']} — {visible_student_no(r)} — {r['status']} — Telegram {r['user_id']}" for r in rows]
+            lines=[f"{visible_student_no(r)} — {r['name']} — {r['status']}\nRegistered: {str(r.get('registered_at') or '-')[:16].replace('T',' ')} — Telegram {r['user_id']}" for r in rows]
         else:
-            lines=[f"{r['name']} — {r['student_no']}\nRole: {r.get('occupation') or r.get('category') or '-'}\nPhone: {r.get('phone') or '-'}\nEmail: {r.get('email') or '-'}" for r in rows]
+            lines=[f"{visible_student_no(r)} — {r['name']}\nRegistered: {str(r.get('registered_at') or '-')[:16].replace('T',' ')}\nRole: {r.get('occupation') or r.get('category') or '-'}\nPhone: {r.get('phone') or '-'}\nEmail: {r.get('email') or '-'}" for r in rows]
         kb=[]
         if offset: kb.append([InlineKeyboardButton("Previous",callback_data=f"admin:students:{max(0,offset-15)}")])
         if len(rows)==15: kb.append([InlineKeyboardButton("Next",callback_data=f"admin:students:{offset+15}")])
@@ -3526,7 +3631,7 @@ async def complete_cmd(update, ctx):
             )
 
     issue_date = datetime.fromisoformat(issued_at).strftime("%d %b %Y")
-    audit_log(update.effective_user.id, "certificate_issued", "student", s["student_no"], f"certificate={cert_no}; issued={issued_at}")
+    audit_log(update.effective_user.id, "certificate_issued", "student", s["student_no"], f"certificate={cert_no}; issued={issued_at}", student_user_id=uid)
     try:
         cert = cards.generate_certificate(s["name"], PROGRAM, issue_date, cert_no)
         verify_url = certificate_verify_url(cert_no)
