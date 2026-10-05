@@ -5,6 +5,7 @@ import json
 import logging
 import os
 import random
+import re
 from html import escape
 from contextlib import asynccontextmanager
 
@@ -229,12 +230,59 @@ def get_student(uid):
         return c.execute("SELECT * FROM students WHERE user_id=?", (uid,)).fetchone()
 
 
+def visible_student_no(student):
+    """Return the cohort-facing Student ID shown to students and on ID cards."""
+    if not student:
+        return "-"
+    public_no = (student.get("display_student_no") or "").strip()
+    if public_no:
+        return public_no
+    internal = (student.get("student_no") or "").strip()
+    m = re.fullmatch(r"HB-(\d+)", internal, re.I)
+    if m:
+        return f"HB-{int(m.group(1)):03d}"
+    return internal or "-"
+
+
 def get_student_by_no(student_no):
+    """Resolve a user-entered Student ID in the active cohort first."""
+    value = (student_no or "").strip().upper()
+    if not value:
+        return None
+    cohort = active_cohort()
     with db() as c:
+        row = c.execute(
+            """SELECT * FROM students
+               WHERE COALESCE(archived,FALSE)=FALSE AND cohort=?
+                 AND (display_student_no ILIKE ? OR student_no ILIKE ?)
+               ORDER BY registered_at DESC LIMIT 1""",
+            (cohort, value, value),
+        ).fetchone()
+        if row:
+            return row
         return c.execute(
-            "SELECT * FROM students WHERE student_no ILIKE ?", (student_no,)
+            "SELECT * FROM students WHERE student_no ILIKE ? ORDER BY registered_at DESC LIMIT 1",
+            (value,),
         ).fetchone()
 
+
+def next_display_student_no(cursor, cohort):
+    """Allocate the lowest unused visible Student ID inside one cohort."""
+    rows = cursor.execute(
+        """SELECT display_student_no FROM students
+           WHERE cohort=? AND display_student_no ~ '^HB-[0-9]+$'""",
+        (cohort,),
+    ).fetchall()
+    used = set()
+    for row in rows:
+        try:
+            used.add(int(str(row.get("display_student_no") or "").split("-", 1)[1]))
+        except Exception:
+            continue
+    number = 1
+    while number in used:
+        number += 1
+    return f"HB-{number:03d}"
 
 def now():
     return datetime.now(TZ)
@@ -826,8 +874,12 @@ def wipe_student_record(admin_uid, student_uid):
     snapshot = {
         "user_id": int(student["user_id"]),
         "name": student.get("name") or "Unknown",
-        "student_no": student.get("student_no") or "-",
+        "student_no": visible_student_no(student),
+        "internal_student_no": student.get("student_no") or "-",
     }
+    if student.get("certificate_issued_at") or student.get("certificate_number"):
+        snapshot["protected"] = True
+        return snapshot
     with db() as c:
         # These tables are explicitly cleared so a removed Telegram account can
         # register again as a genuinely fresh student.
@@ -882,7 +934,7 @@ def certificate_verify_url(cert_no):
 def get_certificate_record(cert_no):
     with db() as c:
         return c.execute(
-            "SELECT name,student_no,certificate_number,certificate_issued_at,status FROM students WHERE certificate_number ILIKE ? AND certificate_issued_at IS NOT NULL",
+            "SELECT name,student_no,display_student_no,certificate_number,certificate_issued_at,status FROM students WHERE certificate_number ILIKE ? AND certificate_issued_at IS NOT NULL",
             (cert_no.strip(),),
         ).fetchone()
 
@@ -1196,13 +1248,17 @@ async def got_category(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                WHERE student_no ~ '^HB-[0-9]+$'"""
         ).fetchone()
         next_no = int(row["max_no"] or 0) + 1
+        # Keep student_no globally unique for legacy records/referral links.
+        # display_student_no is the clean cohort-facing ID and restarts at 001.
         student_no = f"HB-{next_no:04d}"
+        cohort_name = active_cohort()
+        display_student_no = next_display_student_no(c, cohort_name)
         c.execute(
             """INSERT INTO students
                (user_id, username, name, age, phone, email, found_us, goal, occupation, motivation,
-                category, source, plan, student_no, status, paid_amount, registered_at,
+                category, source, plan, student_no, display_student_no, status, paid_amount, registered_at,
                 referred_by, bonus_sent, cohort, archived)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,NULL,?,'registered',0,?,?,FALSE,?,FALSE)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,NULL,?,?,'registered',0,?,?,FALSE,?,FALSE)
                ON CONFLICT (user_id) DO UPDATE SET
                  username=EXCLUDED.username, name=EXCLUDED.name, age=EXCLUDED.age,
                  phone=EXCLUDED.phone, email=EXCLUDED.email, found_us=EXCLUDED.found_us,
@@ -1210,7 +1266,7 @@ async def got_category(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                  source=EXCLUDED.source, referred_by=EXCLUDED.referred_by""",
             (u.id, u.username, d["name"], d["age"], d["phone"], d["email"],
              d["found_us"], d["goal"], d["occupation"], d["motivation"], cat,
-             d.get("source", "direct"), student_no, now().isoformat(), referred_by, active_cohort()),
+             d.get("source", "direct"), student_no, display_student_no, now().isoformat(), referred_by, cohort_name),
         )
 
     await q.edit_message_text(f"Got it — {cat}. ✅")
@@ -1314,15 +1370,15 @@ async def send_registration_pack(ctx, uid):
         return
     await ctx.bot.send_message(
         uid,
-        f"Rules accepted. Your registration is complete!\n\nStudent ID: {s['student_no']}\n"
+        f"Rules accepted. Your registration is complete!\n\nStudent ID: {visible_student_no(s)}\n"
         "Here is your student ID card, official course outline, and crash-course WhatsApp link.",
     )
     try:
-        id_card = cards.generate_id_card(s["name"], s.get("occupation") or s.get("category") or "Academy Student", s["student_no"], PROGRAM)
-        await ctx.bot.send_photo(uid, id_card, caption=f"Your Heribhee Academy Student ID — {s['student_no']}")
+        id_card = cards.generate_id_card(s["name"], s.get("occupation") or s.get("category") or "Academy Student", visible_student_no(s), PROGRAM)
+        await ctx.bot.send_photo(uid, id_card, caption=f"Your Heribhee Academy Student ID — {visible_student_no(s)}")
     except Exception as e:
         log.warning("Could not generate/send ID card: %s", e)
-        await ctx.bot.send_message(uid, f"Your student ID is: {s['student_no']}")
+        await ctx.bot.send_message(uid, f"Your student ID is: {visible_student_no(s)}")
     await send_curriculum_to(ctx, uid)
     if CRASH_COURSE_LINK:
         await ctx.bot.send_message(
@@ -1485,11 +1541,11 @@ async def status_cmd(update, ctx):
         return
     if s.get("free_access"):
         await update.message.reply_text(
-            f"Student ID: {s['student_no']}\nAccess: Complimentary paid-class access granted\nRecorded payment: ₦{int(s['paid_amount'] or 0):,}."
+            f"Student ID: {visible_student_no(s)}\nAccess: Complimentary paid-class access granted\nRecorded payment: ₦{int(s['paid_amount'] or 0):,}."
         )
         return
     await update.message.reply_text(
-        f"Student ID: {s['student_no']}\nStatus: {s['status']}\nPaid: ₦{s['paid_amount']:,} of ₦{PRICE_FULL:,}\nBalance: ₦{max(PRICE_FULL - s['paid_amount'], 0):,}\n\n{BANK_DETAILS}\n\nUse Payment & Status in the menu to submit your receipt."
+        f"Student ID: {visible_student_no(s)}\nStatus: {s['status']}\nPaid: ₦{s['paid_amount']:,} of ₦{PRICE_FULL:,}\nBalance: ₦{max(PRICE_FULL - s['paid_amount'], 0):,}\n\n{BANK_DETAILS}\n\nUse Payment & Status in the menu to submit your receipt."
     )
 
 
@@ -1512,7 +1568,7 @@ async def verify_certificate_cmd(update, ctx):
         return
     issued = datetime.fromisoformat(r["certificate_issued_at"]).strftime("%d %b %Y") if r.get("certificate_issued_at") else "-"
     await update.message.reply_text(
-        f"✅ VERIFIED HERIBHEE CERTIFICATE\n\nCertificate No: {r['certificate_number']}\nRecipient: {r['name']}\nStudent ID: {r['student_no']}\nProgram: {PROGRAM}\nIssued: {issued}\n\nIf the name or certificate number on the presented certificate does not match this record, treat that document as altered or invalid."
+        f"✅ VERIFIED HERIBHEE CERTIFICATE\n\nCertificate No: {r['certificate_number']}\nRecipient: {r['name']}\nStudent ID: {visible_student_no(r)}\nProgram: {PROGRAM}\nIssued: {issued}\n\nIf the name or certificate number on the presented certificate does not match this record, treat that document as altered or invalid."
     )
 
 
@@ -1645,14 +1701,14 @@ async def send_student_id_card(ctx, uid):
         id_card = cards.generate_id_card(
             s["name"],
             s.get("occupation") or s.get("category") or "Academy Student",
-            s["student_no"] or "HB-0000",
+            visible_student_no(s) or "HB-000",
             PROGRAM,
         )
-        await ctx.bot.send_photo(uid, id_card, caption=f"🪪 Your Heribhee Academy Student ID — {s['student_no']}")
+        await ctx.bot.send_photo(uid, id_card, caption=f"🪪 Your Heribhee Academy Student ID — {visible_student_no(s)}")
         return True
     except Exception as e:
         log.warning("Could not generate/send ID card: %s", e)
-        await ctx.bot.send_message(uid, f"Your student ID is: {s['student_no']}")
+        await ctx.bot.send_message(uid, f"Your student ID is: {visible_student_no(s)}")
         return False
 
 
@@ -1864,7 +1920,7 @@ async def show_profile(ctx, uid):
         "MY PROFILE & DOCUMENTS\n\n"
         f"Name: {s['name']}\n"
         f"Occupation / Role: {s.get('occupation') or 'Not set'}\n"
-        f"Student ID: {s['student_no']}\n\n"
+        f"Student ID: {visible_student_no(s)}\n\n"
         f"Name change: {name_edit}\n"
         f"Occupation change: {occupation_edit}\n"
         f"Certificate: {cert_status}\n\n"
@@ -2029,7 +2085,7 @@ async def menu_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         paid = int(s["paid_amount"] or 0)
         if s.get("free_access"):
             await q.message.reply_text(
-                f"PAYMENT & STATUS\n\nStudent ID: {s['student_no']}\nAccess status: Complimentary paid-class access granted\n"
+                f"PAYMENT & STATUS\n\nStudent ID: {visible_student_no(s)}\nAccess status: Complimentary paid-class access granted\n"
                 f"Recorded payment: ₦{paid:,}\n\nYou do not need to make a payment for class access.",
                 reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Open My Classes", callback_data="menu:classes")],[InlineKeyboardButton("Main menu", callback_data="menu:home")]])
             )
@@ -2044,7 +2100,7 @@ async def menu_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             else:
                 pay_kb.append([InlineKeyboardButton(f"Pay remaining balance (₦{balance:,})", callback_data="plan:two")])
         pay_kb.append([InlineKeyboardButton("Main menu", callback_data="menu:home")])
-        msg = (f"PAYMENT & STATUS\n\nStudent ID: {s['student_no']}\nPayment status: {status_label}\n"
+        msg = (f"PAYMENT & STATUS\n\nStudent ID: {visible_student_no(s)}\nPayment status: {status_label}\n"
                f"Amount paid: ₦{paid:,} of ₦{PRICE_FULL:,}\nBalance: ₦{balance:,}\n\n"
                f"Bank details\n{BANK_DETAILS}\n\nAfter transferring, choose a payment option and send your transfer receipt here in the bot. "
                "An Academy admin will verify it manually.")
@@ -2118,7 +2174,7 @@ async def student_private_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE
             c.execute("UPDATE moderation_reports SET user_id=? WHERE user_id=?", (uid, old_uid))
         audit_log(uid, "account_recovered", "student", s["student_no"], f"old_telegram_id={old_uid}; new_telegram_id={uid}")
         ctx.user_data.clear()
-        await msg.reply_text(f"✅ Account recovered successfully. Student ID {s['student_no']} is now linked to this Telegram account.")
+        await msg.reply_text(f"✅ Account recovered successfully. Student ID {visible_student_no(s)} is now linked to this Telegram account.")
         if rules_accepted(uid):
             await send_student_menu(ctx, uid, f"Welcome back, {s['name']}!")
         else:
@@ -2317,7 +2373,7 @@ async def student_private_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE
             )
             return
         await msg.reply_text(
-            f"🧹 STUDENT FOUND\n\nName: {st.get('name') or '-'}\nStudent ID: {st.get('student_no') or '-'}\nStatus: {st.get('status') or '-'}\nPhone: {st.get('phone') or '-'}\nEmail: {st.get('email') or '-'}\nTelegram: {st.get('user_id')}\n\nDo you want to begin permanent clearance for this student?",
+            f"🧹 STUDENT FOUND\n\nName: {st.get('name') or '-'}\nStudent ID: {visible_student_no(st)}\nStatus: {st.get('status') or '-'}\nPhone: {st.get('phone') or '-'}\nEmail: {st.get('email') or '-'}\nTelegram: {st.get('user_id')}\n\nDo you want to begin permanent clearance for this student?",
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("Continue to wipe", callback_data=f"admin:wipe:confirm:{st['user_id']}")],
                 [InlineKeyboardButton("Cancel", callback_data="admin:home")],
@@ -2333,11 +2389,11 @@ async def student_private_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE
         like = f"%{query}%"
         with db() as c:
             rows = c.execute(
-                """SELECT name,student_no,phone,email,occupation,category,status,cohort,archived,user_id
+                """SELECT name,student_no,display_student_no,phone,email,occupation,category,status,cohort,archived,user_id
                    FROM students
-                   WHERE student_no ILIKE ? OR name ILIKE ? OR phone ILIKE ? OR email ILIKE ?
+                   WHERE student_no ILIKE ? OR display_student_no ILIKE ? OR name ILIKE ? OR phone ILIKE ? OR email ILIKE ?
                    ORDER BY archived,name LIMIT 10""",
-                (like, like, like, like),
+                (like, like, like, like, like),
             ).fetchall()
         ctx.user_data.pop("awaiting_student_search", None)
         if not rows:
@@ -2347,9 +2403,9 @@ async def student_private_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE
         for r in rows:
             archive_tag = " [ARCHIVED]" if r.get("archived") else ""
             if uid in ADMIN_IDS:
-                lines.append(f"{r['name']} — {r['student_no']}{archive_tag}\nStatus: {r.get('status') or '-'} | Cohort: {r.get('cohort') or '-'}\nPhone: {r.get('phone') or '-'} | Email: {r.get('email') or '-'}\nTelegram: {r.get('user_id')}")
+                lines.append(f"{r['name']} — {visible_student_no(r)}{archive_tag}\nStatus: {r.get('status') or '-'} | Cohort: {r.get('cohort') or '-'}\nPhone: {r.get('phone') or '-'} | Email: {r.get('email') or '-'}\nTelegram: {r.get('user_id')}")
             else:
-                lines.append(f"{r['name']} — {r['student_no']}{archive_tag}\nRole: {r.get('occupation') or r.get('category') or '-'}\nPhone: {r.get('phone') or '-'} | Email: {r.get('email') or '-'}")
+                lines.append(f"{r['name']} — {visible_student_no(r)}{archive_tag}\nRole: {r.get('occupation') or r.get('category') or '-'}\nPhone: {r.get('phone') or '-'} | Email: {r.get('email') or '-'}")
             lines.append("")
         await msg.reply_text("\n".join(lines), reply_markup=dashboard_keyboard_for(uid))
         return
@@ -2878,7 +2934,7 @@ async def admin_dashboard_callback(update, ctx):
         with db() as c:
             active_count = c.execute("SELECT COUNT(*) n FROM students WHERE COALESCE(archived,FALSE)=FALSE AND cohort=?", (current,)).fetchone()["n"]
             archived = c.execute("SELECT cohort,COUNT(*) n,MAX(archived_at) archived_at FROM students WHERE COALESCE(archived,FALSE)=TRUE GROUP BY cohort ORDER BY MAX(archived_at) DESC NULLS LAST").fetchall()
-        lines = ["🗃 COHORTS / ARCHIVE", "", f"Active cohort: {current}", f"Active students: {active_count}", ""]
+        lines = ["🗃 COHORTS / ARCHIVE", "", f"Active cohort: {current}", f"Active students: {active_count}", "Visible Student IDs restart from HB-001 for each new cohort.", "Deleted non-certified IDs are automatically reused from the lowest available gap.", ""]
         if archived:
             lines.append("Archived cohorts:")
             lines += [f"• {r.get('cohort') or 'Unlabelled'} — {r['n']} students" for r in archived[:15]]
@@ -3079,8 +3135,13 @@ async def admin_dashboard_callback(update, ctx):
         snap = wipe_student_record(uid, target_uid)
         if not snap:
             await q.message.reply_text("That student record no longer exists.", reply_markup=admin_dashboard_keyboard()); return
+        if snap.get("protected"):
+            await q.message.reply_text(
+                f"⚠️ {snap['name']} ({snap['student_no']}) already has an issued certificate. That academic identity is protected and cannot be permanently wiped or recycled.",
+                reply_markup=admin_dashboard_keyboard()
+            ); return
         await q.message.reply_text(
-            f"✅ Student wiped successfully.\n\n{snap['name']} ({snap['student_no']}) has been removed from the bot and can register again from scratch if needed.",
+            f"✅ Student wiped successfully.\n\n{snap['name']} ({snap['student_no']}) has been removed. That visible number is now available for reuse inside this cohort, and the person can register again from scratch if needed.",
             reply_markup=admin_dashboard_keyboard()
         )
         return
@@ -3296,9 +3357,9 @@ async def admin_dashboard_callback(update, ctx):
     if data.startswith("admin:students:"):
         offset=int(data.rsplit(":",1)[1])
         with db() as c:
-            rows=c.execute("SELECT name,student_no,status,user_id,phone,email,occupation,category,cohort FROM students WHERE COALESCE(archived,FALSE)=FALSE ORDER BY name LIMIT 15 OFFSET ?",(offset,)).fetchall()
+            rows=c.execute("SELECT name,student_no,display_student_no,status,user_id,phone,email,occupation,category,cohort FROM students WHERE COALESCE(archived,FALSE)=FALSE ORDER BY name LIMIT 15 OFFSET ?",(offset,)).fetchall()
         if uid in ADMIN_IDS:
-            lines=[f"{r['name']} — {r['student_no']} — {r['status']} — Telegram {r['user_id']}" for r in rows]
+            lines=[f"{r['name']} — {visible_student_no(r)} — {r['status']} — Telegram {r['user_id']}" for r in rows]
         else:
             lines=[f"{r['name']} — {r['student_no']}\nRole: {r.get('occupation') or r.get('category') or '-'}\nPhone: {r.get('phone') or '-'}\nEmail: {r.get('email') or '-'}" for r in rows]
         kb=[]
@@ -3685,7 +3746,7 @@ async def verify_certificate_web(certificate_number: str):
     <p>This certificate number exists in the official Heribhee Studio issuance record.</p>
     <hr><p><b>Certificate No:</b> {escape(str(r['certificate_number']))}</p>
     <p><b>Recipient:</b> {escape(str(r['name']))}</p>
-    <p><b>Student ID:</b> {escape(str(r['student_no']))}</p>
+    <p><b>Student ID:</b> {escape(str(visible_student_no(r)))}</p>
     <p><b>Program:</b> {escape(PROGRAM)}</p>
     <p><b>Issue date:</b> {escape(issued)}</p>
     <hr><p style='font-size:14px'>Compare these details with the certificate presented to you. A changed name, number, or issue date means the document does not match the official record.</p>
