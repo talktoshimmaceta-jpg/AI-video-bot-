@@ -1913,6 +1913,155 @@ async def free_access_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
 
+# ---------- live session recordings (paid students only) ----------
+def _to_dt(value):
+    """The database helper turns timestamps into ISO text, so convert them back to a datetime."""
+    if isinstance(value, str):
+        value = datetime.fromisoformat(value)
+    return value
+
+
+def _fmt_lagos(dt):
+    try:
+        return _to_dt(dt).astimezone(TZ).strftime("%a %d %b, %I:%M %p")
+    except Exception:
+        return str(dt)
+
+
+def build_recordings_view(uid):
+    """Return (text, keyboard) showing the recordings a student is allowed to see right now."""
+    home = [InlineKeyboardButton("Main menu", callback_data="menu:home")]
+    student = get_student(uid)
+    if not student:
+        return "Please register first to see recordings.", InlineKeyboardMarkup([home])
+    if not has_course_access(student):
+        return ("🔒 Recordings are for paid students only. They unlock automatically once your payment is approved.",
+                InlineKeyboardMarkup([home]))
+    with db() as c:
+        rows = c.execute(
+            """SELECT week_number,title,source_ref,expires_at FROM recordings
+               WHERE deleted=FALSE AND release_at<=NOW() AND expires_at>NOW() AND source_ref IS NOT NULL
+               ORDER BY week_number DESC, release_at DESC"""
+        ).fetchall()
+    if not rows:
+        return ("🎥 No recordings are available right now.\n\nEach recording is released after the live session and stays "
+                "available until 8:00 AM the following Friday.", InlineKeyboardMarkup([home]))
+    lines = ["🎥 LIVE SESSION RECORDINGS", "",
+             "Each recording is available for one week, until 8:00 AM the following Friday, then it is removed.", ""]
+    kb = []
+    for r in rows:
+        lines.append(f"• Week {r['week_number']}: {r['title']} (until {_fmt_lagos(r['expires_at'])})")
+        kb.append([InlineKeyboardButton(f"▶ Week {r['week_number']}: {r['title']}"[:60], url=r["source_ref"])])
+    kb.append(home)
+    return "\n".join(lines), InlineKeyboardMarkup(kb)
+
+
+async def recordings_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    text, kb = build_recordings_view(q.from_user.id)
+    await q.message.reply_text(text, reply_markup=kb)
+
+
+async def recordings_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.type != "private":
+        return
+    text, kb = build_recordings_view(update.effective_user.id)
+    await update.effective_message.reply_text(text, reply_markup=kb)
+
+
+async def addrecording_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    if uid not in REVIEWER_IDS or update.effective_chat.type != "private":
+        return
+    msg = update.effective_message
+    args = ctx.args or []
+    usage = ("Usage: /addrecording <week number> <Google Drive link> [title]\n"
+             "Example: /addrecording 1 https://drive.google.com/... Week 1 live session")
+    if len(args) < 2 or not args[0].isdigit() or not args[1].lower().startswith(("http://", "https://")):
+        await msg.reply_text(usage, disable_web_page_preview=True)
+        return
+    week = int(args[0])
+    link = args[1]
+    title = " ".join(args[2:]).strip()[:80] or f"Week {week} live session"
+    with db() as c:
+        row = c.execute(
+            "INSERT INTO recordings (week_number,title,source_ref) VALUES (?,?,?) RETURNING id, release_at, expires_at",
+            (week, title, link),
+        ).fetchone()
+    audit_log(uid, "recording_added", "recording", str(row["id"]), f"week={week}; title={title}")
+    await msg.reply_text(
+        f"✅ Recording added and released now.\nWeek {week}: {title}\n"
+        f"Paid students can watch it until {_fmt_lagos(row['expires_at'])}.\n\n"
+        "Make sure the Drive link is set to 'Anyone with the link can view'.",
+        disable_web_page_preview=True,
+    )
+    for other in ADMIN_IDS:
+        if other != uid:
+            try:
+                await ctx.bot.send_message(other, f"ℹ️ {staff_name(uid)} added the Week {week} recording ({title}). It is live until {_fmt_lagos(row['expires_at'])}.")
+            except Exception:
+                pass
+
+
+async def recordingsadmin_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    if uid not in REVIEWER_IDS or update.effective_chat.type != "private":
+        return
+    with db() as c:
+        rows = c.execute("SELECT week_number,title,deleted,release_at,expires_at FROM recordings ORDER BY created_at DESC LIMIT 10").fetchall()
+    if not rows:
+        await update.effective_message.reply_text("No recordings have been added yet.")
+        return
+    current = datetime.now(TZ)
+    lines = ["🎥 LATEST RECORDINGS", ""]
+    for r in rows:
+        live = (not r["deleted"]) and _to_dt(r["expires_at"]) > current
+        state = "LIVE" if live else "expired/removed"
+        lines.append(f"Week {r['week_number']} - {r['title']} - {state} (until {_fmt_lagos(r['expires_at'])})")
+    await update.effective_message.reply_text("\n".join(lines))
+
+
+async def removerecording_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    if uid not in ADMIN_IDS or update.effective_chat.type != "private":
+        return
+    args = ctx.args or []
+    if not args or not args[0].isdigit():
+        await update.effective_message.reply_text("Usage: /removerecording <week number>\nThis stops students seeing that week's recording straight away.")
+        return
+    week = int(args[0])
+    with db() as c:
+        rows = c.execute("SELECT id,title FROM recordings WHERE week_number=? AND deleted=FALSE", (week,)).fetchall()
+        for r in rows:
+            c.execute("UPDATE recordings SET deleted=TRUE WHERE id=?", (r["id"],))
+    audit_log(uid, "recording_removed", "recording", f"week-{week}", f"{len(rows)} recording(s) hidden from students")
+    await update.effective_message.reply_text(
+        f"✅ {len(rows)} recording(s) for Week {week} are now hidden from students. "
+        "Remember to delete the file from Google Drive so the link stops working."
+        if rows else f"No active recording found for Week {week}."
+    )
+
+
+async def check_recording_expiry(ctx: ContextTypes.DEFAULT_TYPE):
+    """Every few minutes: hide recordings whose time is up and remind the main admins to delete the Drive file."""
+    with db() as c:
+        rows = c.execute("SELECT id,week_number,title,source_ref FROM recordings WHERE deleted=FALSE AND expires_at<=NOW()").fetchall()
+        for r in rows:
+            c.execute("UPDATE recordings SET deleted=TRUE WHERE id=?", (r["id"],))
+    for r in rows:
+        for admin in ADMIN_IDS:
+            try:
+                await ctx.bot.send_message(
+                    admin,
+                    f"⏰ The Week {r['week_number']} recording ({r['title']}) has expired and students can no longer see it.\n"
+                    f"Please delete the file from Google Drive now so the link stops working:\n{r['source_ref']}",
+                    disable_web_page_preview=True,
+                )
+            except Exception:
+                pass
+
+
 async def status_cmd(update, ctx):
     s = get_student(update.effective_user.id)
     if not s:
@@ -2143,6 +2292,7 @@ def student_keyboard(uid=None):
             rel = get_open_test_release(cohort=(s.get("cohort") or active_cohort()))
             if rel and int(rel["week_number"]) not in get_passed_test_weeks(uid):
                 rows.append([InlineKeyboardButton(f"🧠 Week {rel['week_number']} Knowledge Test", callback_data=f"test:start:{rel['week_number']}")])
+            rows.append([InlineKeyboardButton("🎥 Recordings", callback_data="rec:list")])
     rows += [
         [InlineKeyboardButton("🤖 Ask AI", callback_data="menu:assistant"), InlineKeyboardButton("💬 Ask Admin", callback_data="menu:ask")],
         [InlineKeyboardButton("❓ Help & FAQs", callback_data="menu:help"), InlineKeyboardButton("📖 Student Manual", callback_data="menu:manual")],
@@ -4195,6 +4345,11 @@ def build_telegram_application():
     app.add_handler(CommandHandler("stats", stats))
     app.add_handler(CommandHandler("export", export))
     app.add_handler(CommandHandler("groupid", groupid_cmd))
+    app.add_handler(CommandHandler("recordings", recordings_cmd))
+    app.add_handler(CommandHandler("addrecording", addrecording_cmd))
+    app.add_handler(CommandHandler("recordingsadmin", recordingsadmin_cmd))
+    app.add_handler(CommandHandler("removerecording", removerecording_cmd))
+    app.add_handler(CallbackQueryHandler(recordings_callback, pattern=r"^rec:list$"))
     app.add_handler(CommandHandler("exportpdf", export_pdf))
     app.add_handler(CommandHandler("complete", complete_cmd))
     app.add_handler(CommandHandler("broadcast", broadcast))
@@ -4208,6 +4363,7 @@ def build_telegram_application():
     app.job_queue.run_daily(scheduled_group_reminder, time=_parse_hhmm(GROUP_REMINDER_TIME, "17:00"))
     app.job_queue.run_repeating(check_admin_class_reminders, interval=60, first=15)
     app.job_queue.run_repeating(scheduled_expired_test_check, interval=30, first=20)
+    app.job_queue.run_repeating(check_recording_expiry, interval=300, first=40)
     app.add_error_handler(telegram_error_handler)
     return app
 
