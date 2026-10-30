@@ -81,6 +81,8 @@ PAID_CLASS_LINK = (
 BOT_USERNAME = os.getenv("BOT_USERNAME", "")
 REFERRAL_BONUS_THRESHOLD = int(os.getenv("REFERRAL_BONUS_THRESHOLD", "3"))
 REFERRAL_FREE_ACCESS_CAP = int(os.getenv("REFERRAL_FREE_ACCESS_CAP", "20"))
+# Telegram chat id of the paid class group (optional). Needed so a payment reversal can remove the student from it.
+PAID_CLASS_CHAT_ID = int(os.getenv("PAID_CLASS_CHAT_ID", "0") or 0)
 TZ = ZoneInfo("Africa/Lagos")
 
 # Weekly knowledge-test system. Defaults are intentionally usable without new
@@ -1632,6 +1634,173 @@ async def review_payment(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await maybe_send_referral_bonus(ctx, s["referred_by"], q.from_user.id)
 
 
+# ---------- payment reversal (full admins only) ----------
+async def remove_from_paid_group(ctx, user_id):
+    """Remove and block a user from the paid class group. Returns a short result text for the admin."""
+    if not PAID_CLASS_CHAT_ID:
+        return "PAID_CLASS_CHAT_ID is not set in Render, so I could not remove them from the paid class group. Remove them by hand if they joined."
+    try:
+        await ctx.bot.ban_chat_member(PAID_CLASS_CHAT_ID, int(user_id))
+        return "Removed from the paid class group and blocked from rejoining with the invite link."
+    except Exception as e:
+        return f"Could not remove them from the paid class group automatically: {e}"
+
+
+async def perform_payment_reversal(ctx, admin_uid, pid, reason):
+    """Mark an approved payment as reversed (record kept), recalculate the student, and report what happened."""
+    with db() as c:
+        p = c.execute("SELECT * FROM payments WHERE id=?", (pid,)).fetchone()
+        if not p:
+            return "Payment not found."
+        if p["status"] != "approved":
+            return f"Payment #{pid} is '{p['status']}', not approved, so it cannot be reversed."
+        c.execute("UPDATE payments SET status='reversed' WHERE id=?", (pid,))
+        s = c.execute("SELECT * FROM students WHERE user_id=?", (p["user_id"],)).fetchone()
+        new_paid = 0
+        new_status = None
+        if s:
+            new_paid = int(c.execute(
+                "SELECT COALESCE(SUM(amount),0) n FROM payments WHERE user_id=? AND status='approved'",
+                (p["user_id"],),
+            ).fetchone()["n"])
+            if new_paid >= PRICE_FULL:
+                new_status, second_due = "paid", None
+            elif new_paid > 0:
+                new_status = "part_paid"
+                second_due = s.get("second_due") or (now() + timedelta(days=7)).isoformat()
+            else:
+                new_status, second_due = "registered", None
+            c.execute(
+                "UPDATE students SET paid_amount=?, status=?, second_due=? WHERE user_id=?",
+                (new_paid, new_status, second_due, p["user_id"]),
+            )
+    who = s["name"] if s else "unknown student"
+    audit_log(
+        admin_uid, "payment_reversed", "payment", pid,
+        f"user_id={p['user_id']}; amount={p['amount']}; reason={reason}; student_status_after={new_status}; paid_after={new_paid}",
+        student_user_id=p["user_id"],
+    )
+    lines = [f"✅ Payment #{pid} (₦{int(p['amount']):,}) for {who} is now REVERSED. The record and receipt are kept."]
+    if s:
+        lines.append(f"Student status is now '{new_status}' with ₦{new_paid:,} recorded as paid.")
+        has_access = new_status == "paid" or s.get("free_access")
+        if has_access:
+            lines.append("They still qualify for paid-class access through other approved payments or complimentary access.")
+        else:
+            lines.append("They no longer have paid-class access. " + await remove_from_paid_group(ctx, p["user_id"]))
+        ref_no = s.get("referred_by")
+        if ref_no:
+            referrer = get_student_by_no(ref_no)
+            if referrer and referrer.get("bonus_sent") and referrer.get("free_access"):
+                count = paid_referral_count(ref_no)
+                if count < REFERRAL_BONUS_THRESHOLD:
+                    kb = InlineKeyboardMarkup([
+                        [InlineKeyboardButton("Revoke their free access", callback_data=f"rv:rvk:{referrer['user_id']}")],
+                        [InlineKeyboardButton("Keep it", callback_data=f"rv:keep:{referrer['user_id']}")],
+                    ])
+                    try:
+                        await ctx.bot.send_message(
+                            admin_uid,
+                            f"⚠️ {referrer['name']} ({referrer['student_no']}) earned free access using referrals that included {who}. "
+                            f"Their paid referrals are now {count}/{REFERRAL_BONUS_THRESHOLD}. Do you want to revoke their free access?",
+                            reply_markup=kb,
+                        )
+                    except Exception as e:
+                        log.warning("Could not send referral warning: %s", e)
+                    lines.append(f"Referral warning sent: {referrer['name']} now has {count}/{REFERRAL_BONUS_THRESHOLD} paid referrals.")
+        if s.get("certificate_number"):
+            lines.append("Note: this student already has a certificate number. Reversing does not cancel it.")
+    for other in ADMIN_IDS:
+        if other != admin_uid:
+            try:
+                await ctx.bot.send_message(other, f"ℹ️ {staff_name(admin_uid)} reversed payment #{pid} for {who}. Reason: {reason}")
+            except Exception:
+                pass
+    return "\n".join(lines)
+
+
+async def reverse_payment_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    uid = q.from_user.id
+    if uid not in ADMIN_IDS:
+        await q.answer("Full admins only.", show_alert=True)
+        return
+    parts = q.data.split(":")
+    action, arg = parts[1], int(parts[2])
+    await q.answer()
+    back = InlineKeyboardMarkup([[InlineKeyboardButton("Payments", callback_data="admin:payments:0")]])
+    if action == "ask":
+        with db() as c:
+            p = c.execute(
+                """SELECT p.id,p.user_id,p.amount,p.status,s.name,s.student_no,s.certificate_number
+                   FROM payments p LEFT JOIN students s ON s.user_id=p.user_id WHERE p.id=?""",
+                (arg,),
+            ).fetchone()
+        if not p or p["status"] != "approved":
+            await q.message.reply_text("That payment is not in 'approved' status, so it can't be reversed.", reply_markup=back)
+            return
+        ctx.user_data["awaiting_reverse_reason"] = arg
+        warn = "\n⚠️ This student already has a certificate number. Reversing will not cancel it." if p.get("certificate_number") else ""
+        await q.message.reply_text(
+            f"↩ REVERSE PAYMENT #{arg}\n{p['name'] or 'Unknown'} ({p['student_no'] or '-'}) — ₦{int(p['amount']):,}{warn}\n\n"
+            "Type the reason for reversing this payment (for example: fake receipt, not found in bank). It is saved in the audit log.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Cancel", callback_data=f"rv:no:{arg}")]]),
+        )
+        return
+    if action == "no":
+        ctx.user_data.pop("awaiting_reverse_reason", None)
+        ctx.user_data.pop("reverse_pending", None)
+        await q.message.reply_text("Cancelled. Nothing was changed.", reply_markup=back)
+        return
+    if action == "yes":
+        pending = ctx.user_data.get("reverse_pending")
+        if not pending or pending.get("pid") != arg:
+            await q.message.reply_text("This confirmation has expired. Please start again from the Payments list.", reply_markup=back)
+            return
+        ctx.user_data.pop("reverse_pending", None)
+        result = await perform_payment_reversal(ctx, uid, arg, pending["reason"])
+        with db() as c:
+            row = c.execute("SELECT user_id,status FROM payments WHERE id=?", (arg,)).fetchone()
+        kb = [[InlineKeyboardButton("Payments", callback_data="admin:payments:0")]]
+        if row and row["status"] == "reversed":
+            kb.insert(0, [InlineKeyboardButton("Notify the student", callback_data=f"rv:notify:{arg}")])
+        await q.message.reply_text(result, reply_markup=InlineKeyboardMarkup(kb))
+        return
+    if action == "notify":
+        with db() as c:
+            row = c.execute("SELECT user_id,amount FROM payments WHERE id=?", (arg,)).fetchone()
+        if row:
+            try:
+                await ctx.bot.send_message(
+                    row["user_id"],
+                    f"We could not verify your payment of ₦{int(row['amount']):,}, so it has been reversed. "
+                    "If you believe this is a mistake, please contact an Academy admin.",
+                )
+                await q.message.reply_text("Student notified.", reply_markup=back)
+            except Exception as e:
+                await q.message.reply_text(f"Could not message the student: {e}", reply_markup=back)
+        return
+    if action == "rvk":
+        ref = get_student(arg)
+        with db() as c:
+            c.execute("UPDATE students SET free_access=FALSE, bonus_sent=FALSE WHERE user_id=?", (arg,))
+        audit_log(uid, "referral_free_access_revoked", "student", (ref or {}).get("student_no", arg), "revoked after a referred payment was reversed", student_user_id=arg)
+        extra = ""
+        if ref and ref.get("status") != "paid":
+            extra = " " + await remove_from_paid_group(ctx, arg)
+        await q.message.reply_text("Free access revoked." + extra, reply_markup=back)
+        return
+    if action == "keep":
+        await q.message.reply_text("Kept. Their free access is unchanged.", reply_markup=back)
+        return
+
+
+async def groupid_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Full admins can type /groupid inside a group to see that group's chat ID (needed for PAID_CLASS_CHAT_ID)."""
+    if update.effective_user and update.effective_user.id in ADMIN_IDS:
+        await update.effective_message.reply_text(f"This chat's ID is: {update.effective_chat.id}")
+
+
 async def status_cmd(update, ctx):
     s = get_student(update.effective_user.id)
     if not s:
@@ -2243,6 +2412,12 @@ async def deliver_class_access(ctx, uid):
         else:
             await ctx.bot.send_message(uid, "Your crash-course group link is not configured yet. Please contact an Academy admin.")
         return
+    if PAID_CLASS_CHAT_ID:
+        try:
+            # A student removed by a payment reversal is blocked from rejoining; lift that once they have valid access again.
+            await ctx.bot.unban_chat_member(PAID_CLASS_CHAT_ID, int(uid), only_if_banned=True)
+        except Exception:
+            pass
     if PAID_CLASS_LINK:
         await ctx.bot.send_message(
             uid,
@@ -2378,6 +2553,25 @@ async def student_private_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE
             await msg.reply_text("✅ Custom message sent to the class group.", reply_markup=dashboard_keyboard_for(uid))
         except Exception as e:
             await msg.reply_text(f"Could not send to the class group: {e}")
+        return
+
+    if uid in ADMIN_IDS and ctx.user_data.get("awaiting_reverse_reason"):
+        pid = int(ctx.user_data.pop("awaiting_reverse_reason"))
+        reason = (msg.text or "").strip()[:500]
+        if len(reason) < 3:
+            ctx.user_data["awaiting_reverse_reason"] = pid
+            await msg.reply_text("Please type a short reason for the reversal.")
+            return
+        ctx.user_data["reverse_pending"] = {"pid": pid, "reason": reason}
+        await msg.reply_text(
+            f"Confirm: reverse payment #{pid}?\nReason: {reason}\n\n"
+            "The payment stays on record as 'reversed' (it is not deleted), the student's paid total is recalculated, "
+            "and paid access is removed if they no longer qualify.",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("✅ Confirm reversal", callback_data=f"rv:yes:{pid}")],
+                [InlineKeyboardButton("Cancel", callback_data=f"rv:no:{pid}")],
+            ]),
+        )
         return
 
     if uid in ADMIN_IDS and ctx.user_data.get("awaiting_free_access_student_id"):
@@ -3492,6 +3686,9 @@ async def admin_dashboard_callback(update, ctx):
                               ORDER BY p.created_at DESC LIMIT 12 OFFSET ?""",(offset,)).fetchall()
         lines=[f"#{r['id']} — {r['name'] or 'Unknown'} ({r['student_no'] or '-'}) — ₦{r['amount']:,} — {r['status']}" for r in rows]
         kb=[]
+        for r in rows:
+            if r["status"]=="approved" and uid in ADMIN_IDS:
+                kb.append([InlineKeyboardButton(f"↩ Reverse #{r['id']} — {r['name'] or 'Unknown'}",callback_data=f"rv:ask:{r['id']}")])
         if offset: kb.append([InlineKeyboardButton("Previous",callback_data=f"admin:payments:{max(0,offset-12)}")])
         if len(rows)==12: kb.append([InlineKeyboardButton("Next",callback_data=f"admin:payments:{offset+12}")])
         kb.append([InlineKeyboardButton("Admin dashboard",callback_data="admin:home")])
@@ -3823,10 +4020,12 @@ def build_telegram_application():
     app.add_handler(CommandHandler("leaderboard", leaderboard_cmd))
     app.add_handler(CommandHandler("stats", stats))
     app.add_handler(CommandHandler("export", export))
+    app.add_handler(CommandHandler("groupid", groupid_cmd))
     app.add_handler(CommandHandler("exportpdf", export_pdf))
     app.add_handler(CommandHandler("complete", complete_cmd))
     app.add_handler(CommandHandler("broadcast", broadcast))
     app.add_handler(CallbackQueryHandler(review_payment, pattern=r"^(ap|rj):\d+$"))
+    app.add_handler(CallbackQueryHandler(reverse_payment_callback, pattern=r"^rv:(ask|yes|no|notify|rvk|keep):\d+$"))
     app.add_handler(CallbackQueryHandler(choose_plan, pattern=r"^plan:(full|two)$"))
     app.add_handler(MessageHandler((filters.PHOTO | filters.Document.ALL) & filters.ChatType.PRIVATE, got_proof))
     # Automatic private payment reminders intentionally disabled.
