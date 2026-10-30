@@ -1,5 +1,6 @@
 import asyncio
 import csv
+import hmac
 import io
 import json
 import logging
@@ -84,6 +85,9 @@ REFERRAL_FREE_ACCESS_CAP = int(os.getenv("REFERRAL_FREE_ACCESS_CAP", "20"))
 # Telegram chat id of the paid class group, used so a payment reversal can remove the student from it.
 # It uses the existing CLASS_GROUP_ID unless you set PAID_CLASS_CHAT_ID separately in Render.
 PAID_CLASS_CHAT_ID = int(os.getenv("PAID_CLASS_CHAT_ID", "0") or 0) or CLASS_GROUP_ID
+# Shared password both full admins must enter before granting free access. Set FREE_ACCESS_PASSWORD in Render.
+FREE_ACCESS_PASSWORD = os.getenv("FREE_ACCESS_PASSWORD", "").strip()
+_FA_LOCK = {}  # admin user_id -> {"fails": n, "until": datetime} for the password lockout
 TZ = ZoneInfo("Africa/Lagos")
 
 # Weekly knowledge-test system. Defaults are intentionally usable without new
@@ -1802,6 +1806,113 @@ async def groupid_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.effective_message.reply_text(f"This chat's ID is: {update.effective_chat.id}")
 
 
+# ---------- free access: grant (password protected) and revoke ----------
+async def perform_free_access_revoke(ctx, admin_uid, user_id):
+    student = get_student(int(user_id))
+    if not student:
+        return "Student not found."
+    had_access = bool(student.get("free_access"))
+    with db() as c:
+        if had_access and student.get("bonus_sent"):
+            c.execute("UPDATE students SET free_access=FALSE, bonus_sent=FALSE WHERE user_id=?", (int(user_id),))
+        else:
+            c.execute("UPDATE students SET free_access=FALSE WHERE user_id=?", (int(user_id),))
+    audit_log(admin_uid, "free_access_revoked", "student", student["student_no"], student["name"], student_user_id=int(user_id))
+    lines = [f"✅ Free access revoked for {student['name']} ({visible_student_no(student)})."]
+    if not had_access:
+        lines.insert(0, "Note: they did not show complimentary access, so nothing needed changing in their record.")
+    if student.get("status") == "paid":
+        lines.append("They are fully paid, so they keep paid-class access.")
+    else:
+        lines.append(await remove_from_paid_group(ctx, int(user_id)))
+    for other in ADMIN_IDS:
+        if other != admin_uid:
+            try:
+                await ctx.bot.send_message(other, f"ℹ️ {staff_name(admin_uid)} revoked free access for {student['name']} ({visible_student_no(student)}).")
+            except Exception:
+                pass
+    return "\n".join(lines)
+
+
+async def free_access_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    uid = q.from_user.id
+    if uid not in ADMIN_IDS:
+        await q.answer("Full admins only.", show_alert=True)
+        return
+    parts = q.data.split(":")
+    action, arg = parts[1], int(parts[2])
+    await q.answer()
+    home = InlineKeyboardMarkup([[InlineKeyboardButton("Admin dashboard", callback_data="admin:home")]])
+    if action == "cancel":
+        for k in ("fa_pending", "awaiting_free_access_student_id", "awaiting_free_access_password", "awaiting_revoke_access_student_id"):
+            ctx.user_data.pop(k, None)
+        await q.message.reply_text("Cancelled. Nothing was changed.", reply_markup=home)
+        return
+    if action in ("grant", "revoke"):
+        pending = ctx.user_data.get("fa_pending")
+        if not pending or pending.get("mode") != action or pending.get("user_id") != arg:
+            await q.message.reply_text("This confirmation has expired. Please start again from the dashboard.", reply_markup=home)
+            return
+        ctx.user_data.pop("fa_pending", None)
+    if action == "grant":
+        student = get_student(arg)
+        if not student:
+            await q.message.reply_text("That student record no longer exists.", reply_markup=home)
+            return
+        with db() as c:
+            c.execute("UPDATE students SET free_access=TRUE WHERE user_id=?", (arg,))
+        audit_log(uid, "free_access_granted", "student", student["student_no"], student["name"], student_user_id=arg)
+        undo = InlineKeyboardMarkup([
+            [InlineKeyboardButton("↩ Undo (made a mistake)", callback_data=f"fa:undo:{arg}")],
+            [InlineKeyboardButton("Admin dashboard", callback_data="admin:home")],
+        ])
+        await q.message.reply_text(
+            f"✅ Complimentary paid-class access granted to {student['name']} ({visible_student_no(student)}).\n"
+            f"Their recorded payment remains ₦{int(student.get('paid_amount') or 0):,}.",
+            reply_markup=undo,
+        )
+        for other in ADMIN_IDS:
+            if other != uid:
+                try:
+                    await ctx.bot.send_message(other, f"ℹ️ {staff_name(uid)} granted free access to {student['name']} ({visible_student_no(student)}).")
+                except Exception:
+                    pass
+        if PAID_CLASS_CHAT_ID:
+            try:
+                await ctx.bot.unban_chat_member(PAID_CLASS_CHAT_ID, int(arg), only_if_banned=True)
+            except Exception:
+                pass
+        if PAID_CLASS_LINK:
+            try:
+                await ctx.bot.send_message(
+                    arg,
+                    "🎁 COMPLIMENTARY ACCESS GRANTED\n\nYou've been granted free access to the main paid class by Heribhee Studio.",
+                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Join Paid Class", url=PAID_CLASS_LINK)]])
+                )
+            except Exception as e:
+                log.warning("Could not send complimentary access link to %s: %s", arg, e)
+                await q.message.reply_text("Access was recorded, but Telegram could not deliver the class link. The student can open My Classes to retrieve it.")
+        else:
+            await q.message.reply_text("Access was recorded, but PAID_CLASS_LINK is not configured in Render yet.")
+        return
+    if action in ("revoke", "undo"):
+        result = await perform_free_access_revoke(ctx, uid, arg)
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("Notify the student", callback_data=f"fa:notify:{arg}")],
+            [InlineKeyboardButton("Admin dashboard", callback_data="admin:home")],
+        ])
+        await q.message.reply_text(result, reply_markup=kb)
+        return
+    if action == "notify":
+        try:
+            await ctx.bot.send_message(arg, "Your complimentary paid-class access has been removed. Please contact an Academy admin if you have any questions.")
+            await q.message.reply_text("Student notified.", reply_markup=home)
+        except Exception as e:
+            await q.message.reply_text(f"Could not message the student: {e}", reply_markup=home)
+        return
+
+
 async def status_cmd(update, ctx):
     s = get_student(update.effective_user.id)
     if not s:
@@ -2575,6 +2686,44 @@ async def student_private_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE
         )
         return
 
+    if uid in ADMIN_IDS and ctx.user_data.get("awaiting_free_access_password"):
+        entered = (msg.text or "").strip()
+        try:
+            await msg.delete()  # remove the typed password from the chat
+        except Exception:
+            pass
+        lock = _FA_LOCK.get(uid) or {}
+        if lock.get("until") and lock["until"] > now():
+            await ctx.bot.send_message(uid, "Too many wrong attempts. Please wait 15 minutes and try again.")
+            return
+        if not FREE_ACCESS_PASSWORD or not hmac.compare_digest(entered.encode("utf-8"), FREE_ACCESS_PASSWORD.encode("utf-8")):
+            fails = int(lock.get("fails", 0)) + 1
+            if fails >= 3:
+                _FA_LOCK[uid] = {"fails": 0, "until": now() + timedelta(minutes=15)}
+                ctx.user_data.pop("awaiting_free_access_password", None)
+                audit_log(uid, "free_access_password_lockout", "admin", uid, "3 wrong free-access passwords")
+                for other in ADMIN_IDS:
+                    if other != uid:
+                        try:
+                            await ctx.bot.send_message(other, f"⚠️ {staff_name(uid)} entered the free access password wrong 3 times and is locked out for 15 minutes.")
+                        except Exception:
+                            pass
+                await ctx.bot.send_message(uid, "Wrong password 3 times. Free access is locked for you for 15 minutes.")
+            else:
+                _FA_LOCK[uid] = {"fails": fails}
+                await ctx.bot.send_message(uid, f"Wrong password. {3 - fails} attempt(s) left.")
+            return
+        _FA_LOCK.pop(uid, None)
+        ctx.user_data.pop("awaiting_free_access_password", None)
+        ctx.user_data["awaiting_free_access_student_id"] = True
+        await ctx.bot.send_message(
+            uid,
+            "✅ Password accepted.\n\nNow send the student's Student ID, for example: HB-0007\n\n"
+            "The student will be given complimentary access to the paid class without changing their payment amount or revenue records.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Cancel", callback_data="fa:cancel:0")]]),
+        )
+        return
+
     if uid in ADMIN_IDS and ctx.user_data.get("awaiting_free_access_student_id"):
         student_no = (msg.text or "").strip().upper()
         student = get_student_by_no(student_no)
@@ -2584,27 +2733,37 @@ async def student_private_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE
                 "Send /admin if you want to leave this screen."
             )
             return
-        with db() as c:
-            c.execute("UPDATE students SET free_access=TRUE WHERE user_id=?", (student["user_id"],))
-        audit_log(uid, "free_access_granted", "student", student["student_no"], student["name"], student_user_id=student["user_id"])
         ctx.user_data.pop("awaiting_free_access_student_id", None)
+        ctx.user_data["fa_pending"] = {"mode": "grant", "user_id": student["user_id"]}
+        already = "\n⚠️ This student already has complimentary access." if student.get("free_access") else ""
         await msg.reply_text(
-            f"✅ Complimentary paid-class access granted to {student['name']} ({student['student_no']}).\n"
-            f"Their recorded payment remains ₦{int(student.get('paid_amount') or 0):,}.",
-            reply_markup=dashboard_keyboard_for(uid),
+            f"Grant FREE paid-class access to {student['name']} ({visible_student_no(student)})?{already}\n\n"
+            "Please double-check the name and ID before confirming.",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("✅ Yes, grant free access", callback_data=f"fa:grant:{student['user_id']}")],
+                [InlineKeyboardButton("Cancel", callback_data="fa:cancel:0")],
+            ]),
         )
-        if PAID_CLASS_LINK:
-            try:
-                await ctx.bot.send_message(
-                    student["user_id"],
-                    "🎁 COMPLIMENTARY ACCESS GRANTED\n\nYou've been granted free access to the main paid class by Heribhee Studio.",
-                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Join Paid Class", url=PAID_CLASS_LINK)]])
-                )
-            except Exception as e:
-                log.warning("Could not send complimentary access link to %s: %s", student["user_id"], e)
-                await msg.reply_text("Access was recorded, but Telegram could not deliver the class link. The student can open My Classes to retrieve it.")
-        else:
-            await msg.reply_text("Access was recorded, but PAID_CLASS_LINK is not configured in Render yet.")
+        return
+
+    if uid in ADMIN_IDS and ctx.user_data.get("awaiting_revoke_access_student_id"):
+        student_no = (msg.text or "").strip().upper()
+        student = get_student_by_no(student_no)
+        if not student:
+            await msg.reply_text("I couldn't find that Student ID. Please check it and send it again, for example HB-0007.\n\nSend /admin to leave this screen.")
+            return
+        ctx.user_data.pop("awaiting_revoke_access_student_id", None)
+        ctx.user_data["fa_pending"] = {"mode": "revoke", "user_id": student["user_id"]}
+        state = "currently has complimentary access" if student.get("free_access") else "does not currently show complimentary access"
+        await msg.reply_text(
+            f"Revoke free access for {student['name']} ({visible_student_no(student)})?\n"
+            f"They {state}. Their payments and records are not changed. "
+            "If they have not fully paid, they will be removed from the paid class group.",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🚫 Yes, revoke", callback_data=f"fa:revoke:{student['user_id']}")],
+                [InlineKeyboardButton("Cancel", callback_data="fa:cancel:0")],
+            ]),
+        )
         return
 
     if uid in REVIEWER_IDS and ctx.user_data.get("awaiting_review_score"):
@@ -3193,6 +3352,7 @@ def admin_dashboard_keyboard():
         [InlineKeyboardButton("💬 Support questions", callback_data="admin:support:0"), InlineKeyboardButton("📢 Message students", callback_data="admin:message")],
         [InlineKeyboardButton("📣 Group Messages", callback_data="admin:groupmsg"), InlineKeyboardButton("📄 Export PDF", callback_data="admin:export")],
         [InlineKeyboardButton("📊 Statistics", callback_data="admin:stats"), InlineKeyboardButton("🎁 Free Access", callback_data="admin:freeaccess")],
+        [InlineKeyboardButton("🚫 Revoke Free Access", callback_data="admin:revokeaccess")],
         [InlineKeyboardButton("⏰ Class Reminders", callback_data="admin:classreminders"), InlineKeyboardButton("🧠 Weekly Tests", callback_data="admin:tests")],
         [InlineKeyboardButton("🧹 Student Clearance", callback_data="admin:clearance"), InlineKeyboardButton("🆔 Show my Telegram ID", callback_data="admin:myid")],
         [InlineKeyboardButton("📖 Admin Manual", callback_data="admin:manual")],
@@ -3340,10 +3500,23 @@ async def admin_dashboard_callback(update, ctx):
         await q.message.reply_text(f"Current cohort: {active_cohort()}\n\nSend the NEW cohort name. Example: October 2026 Cohort.\n\nWhen you send it, the current cohort will be archived and all future registrations will go into the new cohort.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Cancel", callback_data="admin:home")]]))
         return
     if data == "admin:freeaccess":
-        ctx.user_data["awaiting_free_access_student_id"] = True
+        if not FREE_ACCESS_PASSWORD:
+            await q.message.reply_text(
+                "🔒 Free access is locked because FREE_ACCESS_PASSWORD has not been set in Render. Add it under Environment, then try again.",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Admin dashboard", callback_data="admin:home")]])
+            )
+            return
+        ctx.user_data["awaiting_free_access_password"] = True
         await q.message.reply_text(
-            "🎁 GRANT FREE ACCESS\n\nSend the student's Heribhee Student ID, for example: HB-0007\n\n"
-            "The student will be given complimentary access to the paid class without changing their payment amount or revenue records.",
+            "🔐 GRANT FREE ACCESS\n\nEnter the free access password. Your message will be deleted from this chat as soon as it is read.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Cancel", callback_data="admin:home")]])
+        )
+        return
+    if data == "admin:revokeaccess":
+        ctx.user_data["awaiting_revoke_access_student_id"] = True
+        await q.message.reply_text(
+            "🚫 REVOKE FREE ACCESS\n\nSend the student's Student ID, for example: HB-0007\n\n"
+            "Their payments and records are not changed. If they have not fully paid, they will be removed from the paid class group.",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Cancel", callback_data="admin:home")]])
         )
         return
@@ -4027,6 +4200,7 @@ def build_telegram_application():
     app.add_handler(CommandHandler("broadcast", broadcast))
     app.add_handler(CallbackQueryHandler(review_payment, pattern=r"^(ap|rj):\d+$"))
     app.add_handler(CallbackQueryHandler(reverse_payment_callback, pattern=r"^rv:(ask|yes|no|notify|rvk|keep):\d+$"))
+    app.add_handler(CallbackQueryHandler(free_access_callback, pattern=r"^fa:(grant|revoke|undo|cancel|notify):\d+$"))
     app.add_handler(CallbackQueryHandler(choose_plan, pattern=r"^plan:(full|two)$"))
     app.add_handler(MessageHandler((filters.PHOTO | filters.Document.ALL) & filters.ChatType.PRIVATE, got_proof))
     # Automatic private payment reminders intentionally disabled.
