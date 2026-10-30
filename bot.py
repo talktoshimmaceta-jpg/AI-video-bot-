@@ -2062,6 +2062,129 @@ async def check_recording_expiry(ctx: ContextTypes.DEFAULT_TYPE):
                 pass
 
 
+# ---------- recordings menu for staff (all buttons, nothing to remember) ----------
+def _rec_menu_kb(uid):
+    rows = [
+        [InlineKeyboardButton("➕ Add a recording", callback_data="rc:add")],
+        [InlineKeyboardButton("📋 See recordings", callback_data="rc:list")],
+    ]
+    if uid in ADMIN_IDS:
+        rows.append([InlineKeyboardButton("🗑 Hide a recording", callback_data="rc:rm")])
+    rows.append([InlineKeyboardButton("⬅ Dashboard", callback_data="admin:home")])
+    return InlineKeyboardMarkup(rows)
+
+
+async def recording_menu_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    uid = q.from_user.id
+    if uid not in REVIEWER_IDS:
+        await q.answer("This function is not available to your account.", show_alert=True)
+        return
+    parts = q.data.split(":")
+    action = parts[1]
+    arg = parts[2] if len(parts) > 2 else ""
+    await q.answer()
+    menu_back = InlineKeyboardMarkup([[InlineKeyboardButton("⬅ Recordings menu", callback_data="rc:menu")]])
+
+    if action == "menu":
+        for k in ("awaiting_recording_link", "rec_new_link"):
+            ctx.user_data.pop(k, None)
+        await q.message.reply_text("🎥 RECORDINGS\n\nWhat would you like to do?", reply_markup=_rec_menu_kb(uid))
+        return
+    if action == "cancel":
+        for k in ("awaiting_recording_link", "rec_new_link"):
+            ctx.user_data.pop(k, None)
+        await q.message.reply_text("Cancelled. Nothing was changed.", reply_markup=menu_back)
+        return
+    if action == "add":
+        ctx.user_data["awaiting_recording_link"] = True
+        await q.message.reply_text(
+            "➕ ADD A RECORDING\n\nUpload the recording to Google Drive and set it to 'Anyone with the link can view'. "
+            "Then paste the link here.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Cancel", callback_data="rc:cancel")]]),
+        )
+        return
+    if action == "wk":
+        link = ctx.user_data.get("rec_new_link")
+        if not link or not arg.isdigit():
+            await q.message.reply_text("This step has expired. Please tap Add a recording to start again.", reply_markup=menu_back)
+            return
+        week = int(arg)
+        title = f"Week {week} live session"
+        with db() as c:
+            row = c.execute(
+                "INSERT INTO recordings (week_number,title,source_ref) VALUES (?,?,?) RETURNING id, release_at, expires_at",
+                (week, title, link),
+            ).fetchone()
+        ctx.user_data.pop("rec_new_link", None)
+        audit_log(uid, "recording_added", "recording", str(row["id"]), f"week={week}; title={title}")
+        await q.message.reply_text(
+            f"✅ Week {week} recording added and released now.\n"
+            f"Paid students can watch it until {_fmt_lagos(row['expires_at'])}.",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("➕ Add another", callback_data="rc:add")],
+                [InlineKeyboardButton("⬅ Recordings menu", callback_data="rc:menu")],
+            ]),
+        )
+        for other in ADMIN_IDS:
+            if other != uid:
+                try:
+                    await ctx.bot.send_message(other, f"ℹ️ {staff_name(uid)} added the Week {week} recording. It is live until {_fmt_lagos(row['expires_at'])}.")
+                except Exception:
+                    pass
+        return
+    if action == "list":
+        with db() as c:
+            rows = c.execute("SELECT week_number,title,deleted,expires_at FROM recordings ORDER BY created_at DESC LIMIT 10").fetchall()
+        if not rows:
+            await q.message.reply_text("No recordings have been added yet.", reply_markup=menu_back)
+            return
+        current = datetime.now(TZ)
+        lines = ["🎥 LATEST RECORDINGS", ""]
+        for r in rows:
+            live = (not r["deleted"]) and _to_dt(r["expires_at"]) > current
+            lines.append(f"Week {r['week_number']} - {'LIVE' if live else 'expired/hidden'} (until {_fmt_lagos(r['expires_at'])})")
+        await q.message.reply_text("\n".join(lines), reply_markup=menu_back)
+        return
+    if action in ("rm", "rmid", "rmyes"):
+        if uid not in ADMIN_IDS:
+            await q.message.reply_text("Only full admins can hide a recording.", reply_markup=menu_back)
+            return
+        if action == "rm":
+            with db() as c:
+                rows = c.execute("SELECT id,week_number,title FROM recordings WHERE deleted=FALSE AND expires_at>NOW() ORDER BY week_number").fetchall()
+            if not rows:
+                await q.message.reply_text("There are no live recordings to hide.", reply_markup=menu_back)
+                return
+            kb = [[InlineKeyboardButton(f"🗑 Week {r['week_number']} - {r['title']}"[:60], callback_data=f"rc:rmid:{r['id']}")] for r in rows]
+            kb.append([InlineKeyboardButton("⬅ Recordings menu", callback_data="rc:menu")])
+            await q.message.reply_text("Which recording should students stop seeing?", reply_markup=InlineKeyboardMarkup(kb))
+            return
+        with db() as c:
+            r = c.execute("SELECT id,week_number,title,source_ref FROM recordings WHERE id=CAST(? AS uuid)", (arg,)).fetchone()
+        if not r:
+            await q.message.reply_text("I couldn't find that recording.", reply_markup=menu_back)
+            return
+        if action == "rmid":
+            await q.message.reply_text(
+                f"Hide the Week {r['week_number']} recording from students now?",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("✅ Yes, hide it", callback_data=f"rc:rmyes:{r['id']}")],
+                    [InlineKeyboardButton("Cancel", callback_data="rc:menu")],
+                ]),
+            )
+            return
+        with db() as c:
+            c.execute("UPDATE recordings SET deleted=TRUE WHERE id=CAST(? AS uuid)", (arg,))
+        audit_log(uid, "recording_removed", "recording", str(r["id"]), f"week={r['week_number']}; title={r['title']}")
+        await q.message.reply_text(
+            f"✅ The Week {r['week_number']} recording is now hidden from students.\n\n"
+            f"Remember to delete the file from Google Drive so the link stops working:\n{r['source_ref']}",
+            reply_markup=menu_back, disable_web_page_preview=True,
+        )
+        return
+
+
 async def status_cmd(update, ctx):
     s = get_student(update.effective_user.id)
     if not s:
@@ -2916,6 +3039,23 @@ async def student_private_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE
         )
         return
 
+    if uid in REVIEWER_IDS and ctx.user_data.get("awaiting_recording_link"):
+        link = (msg.text or "").strip()
+        cancel_kb = InlineKeyboardMarkup([[InlineKeyboardButton("Cancel", callback_data="rc:cancel")]])
+        if not link.lower().startswith(("http://", "https://")) or " " in link:
+            await msg.reply_text("That doesn't look like a link. Please paste the full Google Drive link (it starts with https://).", reply_markup=cancel_kb)
+            return
+        ctx.user_data.pop("awaiting_recording_link", None)
+        ctx.user_data["rec_new_link"] = link
+        with db() as c:
+            top = c.execute("SELECT MAX(week_number) m FROM recordings").fetchone()
+        suggested = int((top or {}).get("m") or 0) + 1
+        buttons = [InlineKeyboardButton(("⭐ " if n == suggested else "") + f"Week {n}", callback_data=f"rc:wk:{n}") for n in range(1, 13)]
+        rows = [buttons[i:i + 4] for i in range(0, 12, 4)]
+        rows.append([InlineKeyboardButton("Cancel", callback_data="rc:cancel")])
+        await msg.reply_text(f"Got the link. Which week is this recording for? (⭐ = next week in order: Week {suggested})", reply_markup=InlineKeyboardMarkup(rows))
+        return
+
     if uid in REVIEWER_IDS and ctx.user_data.get("awaiting_review_score"):
         sid = int(ctx.user_data.get("awaiting_review_score"))
         raw = (msg.text or "").strip()
@@ -3503,6 +3643,7 @@ def admin_dashboard_keyboard():
         [InlineKeyboardButton("📣 Group Messages", callback_data="admin:groupmsg"), InlineKeyboardButton("📄 Export PDF", callback_data="admin:export")],
         [InlineKeyboardButton("📊 Statistics", callback_data="admin:stats"), InlineKeyboardButton("🎁 Free Access", callback_data="admin:freeaccess")],
         [InlineKeyboardButton("🚫 Revoke Free Access", callback_data="admin:revokeaccess")],
+        [InlineKeyboardButton("🎥 Recordings", callback_data="rc:menu")],
         [InlineKeyboardButton("⏰ Class Reminders", callback_data="admin:classreminders"), InlineKeyboardButton("🧠 Weekly Tests", callback_data="admin:tests")],
         [InlineKeyboardButton("🧹 Student Clearance", callback_data="admin:clearance"), InlineKeyboardButton("🆔 Show my Telegram ID", callback_data="admin:myid")],
         [InlineKeyboardButton("📖 Admin Manual", callback_data="admin:manual")],
@@ -3515,6 +3656,7 @@ def reviewer_dashboard_keyboard():
         [InlineKeyboardButton("✅ Pending Reviews", callback_data="admin:pending:0"), InlineKeyboardButton("📈 My Performance", callback_data="admin:myperformance")],
         [InlineKeyboardButton("💬 Support Questions", callback_data="admin:support:0"), InlineKeyboardButton("📣 Group Messages", callback_data="admin:groupmsg")],
         [InlineKeyboardButton("📄 Export PDF", callback_data="admin:export"), InlineKeyboardButton("🆔 My Telegram ID", callback_data="admin:myid")],
+        [InlineKeyboardButton("🎥 Recordings", callback_data="rc:menu")],
         [InlineKeyboardButton("📖 Reviewer Manual", callback_data="admin:manual")],
     ])
 
@@ -4350,6 +4492,7 @@ def build_telegram_application():
     app.add_handler(CommandHandler("recordingsadmin", recordingsadmin_cmd))
     app.add_handler(CommandHandler("removerecording", removerecording_cmd))
     app.add_handler(CallbackQueryHandler(recordings_callback, pattern=r"^rec:list$"))
+    app.add_handler(CallbackQueryHandler(recording_menu_callback, pattern=r"^rc:(menu|add|list|rm|rmid|rmyes|wk|cancel)(:[A-Za-z0-9-]+)?$"))
     app.add_handler(CommandHandler("exportpdf", export_pdf))
     app.add_handler(CommandHandler("complete", complete_cmd))
     app.add_handler(CommandHandler("broadcast", broadcast))
