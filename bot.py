@@ -81,8 +81,9 @@ PAID_CLASS_LINK = (
 BOT_USERNAME = os.getenv("BOT_USERNAME", "")
 REFERRAL_BONUS_THRESHOLD = int(os.getenv("REFERRAL_BONUS_THRESHOLD", "3"))
 REFERRAL_FREE_ACCESS_CAP = int(os.getenv("REFERRAL_FREE_ACCESS_CAP", "20"))
-# Telegram chat id of the paid class group (optional). Needed so a payment reversal can remove the student from it.
-PAID_CLASS_CHAT_ID = int(os.getenv("PAID_CLASS_CHAT_ID", "0") or 0)
+# Telegram chat id of the paid class group, used so a payment reversal can remove the student from it.
+# It uses the existing CLASS_GROUP_ID unless you set PAID_CLASS_CHAT_ID separately in Render.
+PAID_CLASS_CHAT_ID = int(os.getenv("PAID_CLASS_CHAT_ID", "0") or 0) or CLASS_GROUP_ID
 TZ = ZoneInfo("Africa/Lagos")
 
 # Weekly knowledge-test system. Defaults are intentionally usable without new
@@ -1638,7 +1639,7 @@ async def review_payment(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def remove_from_paid_group(ctx, user_id):
     """Remove and block a user from the paid class group. Returns a short result text for the admin."""
     if not PAID_CLASS_CHAT_ID:
-        return "PAID_CLASS_CHAT_ID is not set in Render, so I could not remove them from the paid class group. Remove them by hand if they joined."
+        return "No class group ID is set in Render (CLASS_GROUP_ID), so I could not remove them from the paid class group. Remove them by hand if they joined."
     try:
         await ctx.bot.ban_chat_member(PAID_CLASS_CHAT_ID, int(user_id))
         return "Removed from the paid class group and blocked from rejoining with the invite link."
