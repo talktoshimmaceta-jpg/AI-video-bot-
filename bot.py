@@ -2185,6 +2185,131 @@ async def recording_menu_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE
         return
 
 
+# ---------- pre-class survey (4 quick taps; registration already asks goal and how they heard about us) ----------
+SURVEY_QUESTIONS = [
+    ("level", "What is your current level with AI?",
+     ["Complete beginner", "I've tried a few tools", "I use AI regularly", "Advanced"]),
+    ("devices", "Which device will you mainly use for the class?",
+     ["Phone only", "Laptop or computer", "Both phone and laptop"]),
+    ("hours_per_week", "How many hours a week can you give this class?",
+     ["1-3 hours", "4-6 hours", "7-10 hours", "More than 10 hours"]),
+    ("biggest_challenge", "What is your biggest challenge with AI right now?",
+     ["I don't know where to start", "Writing good prompts", "Finding time to practise",
+      "Turning AI skills into income", "Keeping up with new tools"]),
+]
+
+
+def survey_done(uid):
+    try:
+        with db() as c:
+            r = c.execute("SELECT biggest_challenge FROM survey_responses WHERE telegram_id=?", (uid,)).fetchone()
+        return bool(r and r.get("biggest_challenge"))
+    except Exception:
+        return True  # if the table cannot be read, hide the button rather than break the menu
+
+
+def survey_question_view(n):
+    key, text, options = SURVEY_QUESTIONS[n]
+    kb = [[InlineKeyboardButton(opt, callback_data=f"sv:a:{n}:{i}")] for i, opt in enumerate(options)]
+    kb.append([InlineKeyboardButton("Skip for now", callback_data="sv:skip")])
+    return f"📝 QUICK SURVEY ({n + 1}/{len(SURVEY_QUESTIONS)})\n\n{text}", InlineKeyboardMarkup(kb)
+
+
+async def offer_survey(ctx, uid):
+    if survey_done(uid):
+        return
+    await ctx.bot.send_message(
+        uid,
+        "📝 QUICK SURVEY\n\nHelp us tailor the class to you. It takes about 30 seconds, just 4 taps.",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("Start survey", callback_data="sv:start")],
+            [InlineKeyboardButton("Skip for now", callback_data="sv:skip")],
+        ]),
+    )
+
+
+async def _show(q, text, kb):
+    try:
+        await q.message.edit_text(text, reply_markup=kb)
+    except Exception:
+        await q.message.reply_text(text, reply_markup=kb)
+
+
+async def survey_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    uid = q.from_user.id
+    await q.answer()
+    parts = q.data.split(":")
+    action = parts[1]
+    menu_kb = InlineKeyboardMarkup([[InlineKeyboardButton("Main menu", callback_data="menu:home")]])
+
+    if action == "results":
+        if uid not in REVIEWER_IDS:
+            await q.message.reply_text("This function is not available to your account.")
+            return
+        with db() as c:
+            total = c.execute("SELECT COUNT(*) n FROM students WHERE COALESCE(archived,FALSE)=FALSE").fetchone()["n"]
+            done = c.execute("SELECT COUNT(*) n FROM survey_responses WHERE biggest_challenge IS NOT NULL").fetchone()["n"]
+            lines = ["📝 SURVEY RESULTS", "", f"Completed: {done} of {total} students", ""]
+            for key, text, options in SURVEY_QUESTIONS:
+                rows = c.execute(
+                    f"SELECT {key} v, COUNT(*) n FROM survey_responses WHERE {key} IS NOT NULL GROUP BY {key} ORDER BY n DESC"
+                ).fetchall()
+                answered = sum(int(r["n"]) for r in rows) or 1
+                lines.append(text)
+                if not rows:
+                    lines.append("  No answers yet")
+                for r in rows:
+                    lines.append(f"  - {r['v']}: {r['n']} ({round(100 * int(r['n']) / answered)}%)")
+                lines.append("")
+            heard = c.execute(
+                """SELECT LOWER(TRIM(found_us)) v, COUNT(*) n FROM students
+                   WHERE COALESCE(archived,FALSE)=FALSE AND found_us IS NOT NULL AND TRIM(found_us)<>''
+                   GROUP BY LOWER(TRIM(found_us)) ORDER BY n DESC LIMIT 8"""
+            ).fetchall()
+        lines.append("How students say they heard about us (from registration):")
+        if not heard:
+            lines.append("  No answers yet")
+        for r in heard:
+            lines.append(f"  - {r['v']}: {r['n']}")
+        await q.message.reply_text(
+            "\n".join(lines),
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Admin dashboard", callback_data="admin:home")]]),
+        )
+        return
+
+    if not get_student(uid):
+        await q.message.reply_text("Please register first using /start.")
+        return
+    if action == "start":
+        if survey_done(uid):
+            await _show(q, "You've already completed the survey. Thank you!", menu_kb)
+            return
+        text, kb = survey_question_view(0)
+        await _show(q, text, kb)
+        return
+    if action == "skip":
+        await _show(q, "No problem. You can finish the survey any time from the main menu.", menu_kb)
+        return
+    if action == "a" and len(parts) == 4 and parts[2].isdigit() and parts[3].isdigit():
+        n, i = int(parts[2]), int(parts[3])
+        if n >= len(SURVEY_QUESTIONS) or i >= len(SURVEY_QUESTIONS[n][2]):
+            return
+        key, _, options = SURVEY_QUESTIONS[n]
+        with db() as c:
+            c.execute(
+                f"INSERT INTO survey_responses (telegram_id, {key}) VALUES (?, ?) "
+                f"ON CONFLICT (telegram_id) DO UPDATE SET {key}=EXCLUDED.{key}",
+                (uid, options[i]),
+            )
+        if n + 1 < len(SURVEY_QUESTIONS):
+            text, kb = survey_question_view(n + 1)
+            await _show(q, text, kb)
+        else:
+            await _show(q, "✅ Thank you! Your answers help us tailor the class to you.", menu_kb)
+        return
+
+
 async def status_cmd(update, ctx):
     s = get_student(update.effective_user.id)
     if not s:
@@ -2416,6 +2541,8 @@ def student_keyboard(uid=None):
             if rel and int(rel["week_number"]) not in get_passed_test_weeks(uid):
                 rows.append([InlineKeyboardButton(f"🧠 Week {rel['week_number']} Knowledge Test", callback_data=f"test:start:{rel['week_number']}")])
             rows.append([InlineKeyboardButton("🎥 Recordings", callback_data="rec:list")])
+    if uid is not None and not survey_done(uid):
+        rows.append([InlineKeyboardButton("📝 Quick Survey (4 taps)", callback_data="sv:start")])
     rows += [
         [InlineKeyboardButton("🤖 Ask AI", callback_data="menu:assistant"), InlineKeyboardButton("💬 Ask Admin", callback_data="menu:ask")],
         [InlineKeyboardButton("❓ Help & FAQs", callback_data="menu:help"), InlineKeyboardButton("📖 Student Manual", callback_data="menu:manual")],
@@ -2657,6 +2784,7 @@ async def menu_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         # Registration gives the student their ID, curriculum and free crash-course link.
         # Do not prompt for payment here; the Academy will announce when payment opens.
         await send_registration_pack(ctx, uid)
+        await offer_survey(ctx, uid)
         await send_student_menu(ctx, uid)
         return
     if data.startswith("faq:"):
@@ -3643,7 +3771,7 @@ def admin_dashboard_keyboard():
         [InlineKeyboardButton("📣 Group Messages", callback_data="admin:groupmsg"), InlineKeyboardButton("📄 Export PDF", callback_data="admin:export")],
         [InlineKeyboardButton("📊 Statistics", callback_data="admin:stats"), InlineKeyboardButton("🎁 Free Access", callback_data="admin:freeaccess")],
         [InlineKeyboardButton("🚫 Revoke Free Access", callback_data="admin:revokeaccess")],
-        [InlineKeyboardButton("🎥 Recordings", callback_data="rc:menu")],
+        [InlineKeyboardButton("🎥 Recordings", callback_data="rc:menu"), InlineKeyboardButton("📝 Survey Results", callback_data="sv:results")],
         [InlineKeyboardButton("⏰ Class Reminders", callback_data="admin:classreminders"), InlineKeyboardButton("🧠 Weekly Tests", callback_data="admin:tests")],
         [InlineKeyboardButton("🧹 Student Clearance", callback_data="admin:clearance"), InlineKeyboardButton("🆔 Show my Telegram ID", callback_data="admin:myid")],
         [InlineKeyboardButton("📖 Admin Manual", callback_data="admin:manual")],
@@ -3656,7 +3784,7 @@ def reviewer_dashboard_keyboard():
         [InlineKeyboardButton("✅ Pending Reviews", callback_data="admin:pending:0"), InlineKeyboardButton("📈 My Performance", callback_data="admin:myperformance")],
         [InlineKeyboardButton("💬 Support Questions", callback_data="admin:support:0"), InlineKeyboardButton("📣 Group Messages", callback_data="admin:groupmsg")],
         [InlineKeyboardButton("📄 Export PDF", callback_data="admin:export"), InlineKeyboardButton("🆔 My Telegram ID", callback_data="admin:myid")],
-        [InlineKeyboardButton("🎥 Recordings", callback_data="rc:menu")],
+        [InlineKeyboardButton("🎥 Recordings", callback_data="rc:menu"), InlineKeyboardButton("📝 Survey Results", callback_data="sv:results")],
         [InlineKeyboardButton("📖 Reviewer Manual", callback_data="admin:manual")],
     ])
 
@@ -4492,6 +4620,7 @@ def build_telegram_application():
     app.add_handler(CommandHandler("recordingsadmin", recordingsadmin_cmd))
     app.add_handler(CommandHandler("removerecording", removerecording_cmd))
     app.add_handler(CallbackQueryHandler(recordings_callback, pattern=r"^rec:list$"))
+    app.add_handler(CallbackQueryHandler(survey_callback, pattern=r"^sv:(start|skip|a|results)(:\d+){0,2}$"))
     app.add_handler(CallbackQueryHandler(recording_menu_callback, pattern=r"^rc:(menu|add|list|rm|rmid|rmyes|wk|cancel)(:[A-Za-z0-9-]+)?$"))
     app.add_handler(CommandHandler("exportpdf", export_pdf))
     app.add_handler(CommandHandler("complete", complete_cmd))
