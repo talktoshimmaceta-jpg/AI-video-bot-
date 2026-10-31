@@ -1555,14 +1555,18 @@ async def choose_plan(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def got_proof(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
-    # A photo or file sent while the student is busy with another task (assignment, testimonial, support question...)
-    # is not a payment receipt. Only treat it as one if they have just opened the payment instructions.
-    if not ctx.user_data.get("awaiting_proof"):
-        if any(k.startswith("awaiting_") and v for k, v in ctx.user_data.items()):
-            return
     s = get_student(uid)
     if not s:
         await update.message.reply_text("Please register first with /start.")
+        return
+    # A photo or file is only a payment receipt right after the student has opened the payment instructions
+    # (Payment & Status). Anything else, such as an assignment, a testimonial or a random picture, is ignored here.
+    if not ctx.user_data.get("awaiting_proof"):
+        if not any(k.startswith("awaiting_") and v for k, v in ctx.user_data.items()):
+            await update.message.reply_text(
+                "If you are sending a payment receipt, please open Payment & Status in the menu first, "
+                "follow the payment instructions, then send the receipt here."
+            )
         return
     amount = ctx.user_data.get("awaiting_proof") or amount_due(s)
     if amount == 0:
