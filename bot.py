@@ -1555,6 +1555,11 @@ async def choose_plan(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def got_proof(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
+    # A photo or file sent while the student is busy with another task (assignment, testimonial, support question...)
+    # is not a payment receipt. Only treat it as one if they have just opened the payment instructions.
+    if not ctx.user_data.get("awaiting_proof"):
+        if any(k.startswith("awaiting_") and v for k, v in ctx.user_data.items()):
+            return
     s = get_student(uid)
     if not s:
         await update.message.reply_text("Please register first with /start.")
@@ -2308,6 +2313,296 @@ async def survey_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         else:
             await _show(q, "✅ Thank you! Your answers help us tailor the class to you.", menu_kb)
         return
+
+
+# ---------- testimonials and results ----------
+TESTIMONIAL_PROMPTS = {
+    "first_assignment": "Well done on finishing your first assignment, {name}! 🎉\n\nTwo quick questions:\n1. What did you create?\n2. What was hard before that feels easier now?\n\nYou can answer with text, a voice note or a screenshot.",
+    "midpoint": "You are halfway there, {name}! 🎉\n\nWhat is the most useful thing you have learned so far, and have you used it in real life yet?\n\nYou can answer with text, a voice note or a screenshot.",
+    "final": "Congratulations on finishing, {name}! 🎓\n\nTell us about your final project and what has changed for you since joining: a skill, a client, income, a job, a business idea.\n\nA voice note or a screenshot of your work is perfect too.",
+}
+TM_PERMS = {
+    "wn": ("yes_with_name", "Yes, with my name"),
+    "wo": ("yes_without_name", "Yes, without my name"),
+    "no": ("no", "No, keep it private"),
+}
+TM_LABEL = {
+    "yes_with_name": "✅ may be used WITH name",
+    "yes_without_name": "✅ may be used WITHOUT name",
+    "no": "⛔ private - do not use",
+}
+MOMENT_LABEL = {"first_assignment": "First assignment", "midpoint": "Midpoint", "final": "Final project"}
+
+
+async def send_testimonial_request(bot, uid, moment):
+    s = get_student(uid)
+    if not s:
+        return False
+    with db() as c:
+        done = c.execute("SELECT 1 x FROM testimonials WHERE telegram_id=? AND moment=?", (uid, moment)).fetchone()
+    if done:
+        return False
+    first = (s.get("name") or "there").split()[0]
+    try:
+        await bot.send_message(
+            uid,
+            TESTIMONIAL_PROMPTS[moment].format(name=first),
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("✍ Send my answer", callback_data=f"tm:start:{moment}")],
+                [InlineKeyboardButton("Skip", callback_data="tm:skip")],
+            ]),
+        )
+        return True
+    except Exception as e:
+        log.warning("Could not send testimonial request to %s: %s", uid, e)
+        return False
+
+
+async def _first_testimonial_job(ctx: ContextTypes.DEFAULT_TYPE):
+    await send_testimonial_request(ctx.bot, ctx.job.data["uid"], "first_assignment")
+
+
+async def maybe_schedule_first_testimonial(ctx, uid):
+    """After a student's very first assignment submission, ask for a testimonial a couple of minutes later (once only)."""
+    try:
+        with db() as c:
+            n = c.execute("SELECT COUNT(*) n FROM assignment_submissions WHERE user_id=?", (uid,)).fetchone()["n"]
+        if int(n) != 1:
+            return
+        key = f"tm_asked:first_assignment:{uid}"
+        if get_app_setting(key):
+            return
+        set_app_setting(key, "1")
+        ctx.job_queue.run_once(_first_testimonial_job, 120, data={"uid": uid})
+    except Exception as e:
+        log.warning("Could not schedule first-assignment testimonial: %s", e)
+
+
+async def broadcast_testimonial_request(ctx, moment):
+    with db() as c:
+        ids = [r["user_id"] for r in c.execute(
+            "SELECT user_id FROM students WHERE COALESCE(archived,FALSE)=FALSE AND (status='paid' OR COALESCE(free_access,FALSE)=TRUE)"
+        ).fetchall()]
+    sent = 0
+    for u in ids:
+        if await send_testimonial_request(ctx.bot, u, moment):
+            sent += 1
+        await asyncio.sleep(0.05)
+    return sent, len(ids)
+
+
+async def daily_testimonial_check(ctx: ContextTypes.DEFAULT_TYPE):
+    """Every day at 6 PM: send the midpoint / final request once its date has arrived."""
+    today = datetime.now(TZ).date().isoformat()
+    missing = []
+    for moment in ("midpoint", "final"):
+        date = get_app_setting(f"testimonial_{moment}_date", "") or ""
+        sent_flag = get_app_setting(f"testimonial_{moment}_sent", "") or ""
+        if not date:
+            missing.append(moment)
+            continue
+        if date <= today and not sent_flag:
+            set_app_setting(f"testimonial_{moment}_sent", today)  # mark first so it can never go out twice
+            sent, total = await broadcast_testimonial_request(ctx, moment)
+            for admin in ADMIN_IDS:
+                try:
+                    await ctx.bot.send_message(admin, f"📣 The {MOMENT_LABEL[moment].lower()} testimonial request was sent to {sent} of {total} paid students.")
+                except Exception:
+                    pass
+    if missing and datetime.now(TZ).weekday() == 0:
+        for admin in ADMIN_IDS:
+            try:
+                await ctx.bot.send_message(admin, "⏰ Reminder: the testimonial dates are not set yet. Open Dashboard > Testimonials > Set dates, so the requests go out automatically.")
+            except Exception:
+                pass
+
+
+async def capture_testimonial(update, ctx):
+    msg = update.effective_message
+    uid = update.effective_user.id
+    moment = ctx.user_data.get("awaiting_testimonial")
+    if moment not in TESTIMONIAL_PROMPTS or not get_student(uid):
+        ctx.user_data.pop("awaiting_testimonial", None)
+        return
+    text = (msg.text or msg.caption or "").strip()
+    file_id = None
+    if msg.voice:
+        file_id = "voice:" + msg.voice.file_id
+    elif msg.audio:
+        file_id = "audio:" + msg.audio.file_id
+    elif msg.video_note:
+        file_id = "vnote:" + msg.video_note.file_id
+    elif msg.photo:
+        file_id = "photo:" + msg.photo[-1].file_id
+    elif msg.video:
+        file_id = "video:" + msg.video.file_id
+    elif msg.document:
+        file_id = "doc:" + msg.document.file_id
+    if not text and not file_id:
+        await msg.reply_text("Please send your answer as text, a voice note or a screenshot.")
+        return
+    with db() as c:
+        c.execute(
+            "INSERT INTO testimonials (telegram_id, moment, content_text, file_id, permission) VALUES (?,?,?,?,'no') "
+            "ON CONFLICT (telegram_id, moment) DO UPDATE SET content_text=EXCLUDED.content_text, file_id=EXCLUDED.file_id, permission='no'",
+            (uid, moment, text[:2000] or None, file_id),
+        )
+    ctx.user_data.pop("awaiting_testimonial", None)
+    kb = [[InlineKeyboardButton(label, callback_data=f"tm:perm:{moment}:{code}")] for code, (_, label) in TM_PERMS.items()]
+    await msg.reply_text("Thank you! ❤️\n\nMay we share your words in our promotions?", reply_markup=InlineKeyboardMarkup(kb))
+
+
+async def testimonial_voice_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if ctx.user_data.get("awaiting_testimonial"):
+        await capture_testimonial(update, ctx)
+
+
+def _tm_menu(uid):
+    mid = get_app_setting("testimonial_midpoint_date", "") or "not set"
+    fin = get_app_setting("testimonial_final_date", "") or "not set"
+    mid_sent = " (sent)" if get_app_setting("testimonial_midpoint_sent", "") else ""
+    fin_sent = " (sent)" if get_app_setting("testimonial_final_sent", "") else ""
+    text = (
+        "💬 TESTIMONIALS\n\n"
+        f"Midpoint request: {mid}{mid_sent}\n"
+        f"Final project request: {fin}{fin_sent}\n\n"
+        "The first-assignment request goes out by itself a couple of minutes after a student's first submission. "
+        "The midpoint and final requests go to all paid students automatically at 6:00 PM Nigeria time on the dates above."
+    )
+    rows = [[InlineKeyboardButton("📋 See testimonials", callback_data="tm:list")]]
+    if uid in ADMIN_IDS:
+        rows.append([InlineKeyboardButton("📅 Set midpoint & final dates", callback_data="tm:dates")])
+        rows.append([InlineKeyboardButton("📣 Send midpoint request now", callback_data="tm:sendnow:midpoint")])
+        rows.append([InlineKeyboardButton("📣 Send final request now", callback_data="tm:sendnow:final")])
+    rows.append([InlineKeyboardButton("⬅ Dashboard", callback_data="admin:home")])
+    return text, InlineKeyboardMarkup(rows)
+
+
+async def testimonial_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    uid = q.from_user.id
+    await q.answer()
+    parts = q.data.split(":")
+    action = parts[1]
+    arg = parts[2] if len(parts) > 2 else ""
+    arg2 = parts[3] if len(parts) > 3 else ""
+
+    # ----- student side -----
+    if action == "start":
+        if arg not in TESTIMONIAL_PROMPTS or not get_student(uid):
+            return
+        ctx.user_data["awaiting_testimonial"] = arg
+        await q.message.reply_text("Go ahead and send your answer now: type it, record a voice note, or send a screenshot.")
+        return
+    if action == "skip":
+        try:
+            await q.message.edit_text("No problem. Thank you!")
+        except Exception:
+            await q.message.reply_text("No problem. Thank you!")
+        return
+    if action == "perm":
+        if arg not in TESTIMONIAL_PERM_MOMENTS or arg2 not in TM_PERMS:
+            return
+        with db() as c:
+            c.execute("UPDATE testimonials SET permission=? WHERE telegram_id=? AND moment=?", (TM_PERMS[arg2][0], uid, arg))
+        try:
+            await q.message.edit_text("✅ Saved. Thank you so much for sharing!")
+        except Exception:
+            await q.message.reply_text("✅ Saved. Thank you so much for sharing!")
+        return
+
+    # ----- staff side -----
+    if uid not in REVIEWER_IDS:
+        await q.message.reply_text("This function is not available to your account.")
+        return
+    back = InlineKeyboardMarkup([[InlineKeyboardButton("⬅ Testimonials menu", callback_data="tm:menu")]])
+    if action == "menu":
+        text, kb = _tm_menu(uid)
+        await q.message.reply_text(text, reply_markup=kb)
+        return
+    if action == "list":
+        with db() as c:
+            rows = c.execute(
+                """SELECT t.id, t.moment, t.permission, t.content_text, t.file_id, s.name, s.student_no, s.display_student_no
+                   FROM testimonials t LEFT JOIN students s ON s.user_id=t.telegram_id
+                   ORDER BY t.created_at DESC LIMIT 10"""
+            ).fetchall()
+        if not rows:
+            await q.message.reply_text("No testimonials have come in yet.", reply_markup=back)
+            return
+        lines = ["💬 LATEST TESTIMONIALS", ""]
+        kb = []
+        for i, r in enumerate(rows, 1):
+            preview = (r["content_text"] or ("(voice note)" if (r["file_id"] or "").startswith(("voice:", "audio:", "vnote:")) else "(file)"))[:70]
+            lines.append(f"{i}. {r['name'] or 'Unknown'} - {MOMENT_LABEL.get(r['moment'], r['moment'])}\n   {TM_LABEL.get(r['permission'], r['permission'])}\n   {preview}")
+            kb.append([InlineKeyboardButton(f"Open #{i} - {r['name'] or 'Unknown'}"[:60], callback_data=f"tm:open:{r['id']}")])
+        kb.append([InlineKeyboardButton("⬅ Testimonials menu", callback_data="tm:menu")])
+        await q.message.reply_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(kb))
+        return
+    if action == "open":
+        with db() as c:
+            r = c.execute(
+                """SELECT t.moment, t.permission, t.content_text, t.file_id, s.name, s.student_no, s.display_student_no
+                   FROM testimonials t LEFT JOIN students s ON s.user_id=t.telegram_id WHERE t.id=CAST(? AS uuid)""",
+                (arg,),
+            ).fetchone()
+        if not r:
+            await q.message.reply_text("I couldn't find that testimonial.", reply_markup=back)
+            return
+        await q.message.reply_text(
+            f"{r['name'] or 'Unknown'} ({visible_student_no(r) if r.get('student_no') else '-'})\n"
+            f"{MOMENT_LABEL.get(r['moment'], r['moment'])} - {TM_LABEL.get(r['permission'], r['permission'])}\n\n"
+            f"{r['content_text'] or '(no text)'}",
+            reply_markup=back,
+        )
+        kind, _, fid = (r["file_id"] or "").partition(":")
+        try:
+            if kind == "voice":
+                await ctx.bot.send_voice(uid, fid)
+            elif kind == "audio":
+                await ctx.bot.send_audio(uid, fid)
+            elif kind == "vnote":
+                await ctx.bot.send_video_note(uid, fid)
+            elif kind == "photo":
+                await ctx.bot.send_photo(uid, fid)
+            elif kind == "video":
+                await ctx.bot.send_video(uid, fid)
+            elif kind == "doc":
+                await ctx.bot.send_document(uid, fid)
+        except Exception as e:
+            await q.message.reply_text(f"Could not load the attached file: {e}")
+        return
+
+    # ----- main admins only -----
+    if uid not in ADMIN_IDS:
+        await q.message.reply_text("Only full admins can do this.", reply_markup=back)
+        return
+    if action == "dates":
+        ctx.user_data["awaiting_tm_date"] = "midpoint"
+        await q.message.reply_text(
+            "📅 SET TESTIMONIAL DATES\n\nSend the MIDPOINT date in this format: 2026-11-20\n\n"
+            "The request goes to all paid students at 6:00 PM Nigeria time on that day. A date in the past sends it the next evening.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Cancel", callback_data="tm:menu")]]),
+        )
+        return
+    if action == "sendnow" and arg in ("midpoint", "final"):
+        await q.message.reply_text(
+            f"Send the {MOMENT_LABEL[arg].lower()} testimonial request to all paid students right now? Students who already answered are skipped.",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("✅ Yes, send now", callback_data=f"tm:sendyes:{arg}")],
+                [InlineKeyboardButton("Cancel", callback_data="tm:menu")],
+            ]),
+        )
+        return
+    if action == "sendyes" and arg in ("midpoint", "final"):
+        set_app_setting(f"testimonial_{arg}_sent", datetime.now(TZ).date().isoformat())
+        sent, total = await broadcast_testimonial_request(ctx, arg)
+        audit_log(uid, "testimonial_request_sent", "testimonials", arg, f"sent to {sent} of {total}")
+        await q.message.reply_text(f"✅ Sent to {sent} of {total} paid students.", reply_markup=back)
+        return
+
+
+TESTIMONIAL_PERM_MOMENTS = set(TESTIMONIAL_PROMPTS)
 
 
 async def status_cmd(update, ctx):
@@ -3184,6 +3479,28 @@ async def student_private_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE
         await msg.reply_text(f"Got the link. Which week is this recording for? (⭐ = next week in order: Week {suggested})", reply_markup=InlineKeyboardMarkup(rows))
         return
 
+    if uid in ADMIN_IDS and ctx.user_data.get("awaiting_tm_date"):
+        which = ctx.user_data.get("awaiting_tm_date")
+        try:
+            d = datetime.strptime((msg.text or "").strip(), "%Y-%m-%d").date()
+        except Exception:
+            await msg.reply_text("Please send the date in this format: 2026-11-20")
+            return
+        set_app_setting(f"testimonial_{which}_date", d.isoformat())
+        set_app_setting(f"testimonial_{which}_sent", "")
+        if which == "midpoint":
+            ctx.user_data["awaiting_tm_date"] = "final"
+            await msg.reply_text(f"Midpoint date saved: {d.isoformat()}.\n\nNow send the FINAL project date in the same format, for example 2026-12-18.")
+        else:
+            ctx.user_data.pop("awaiting_tm_date", None)
+            await msg.reply_text("✅ Both dates are saved. The requests go out automatically at 6:00 PM Nigeria time on those dates.",
+                                 reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅ Testimonials menu", callback_data="tm:menu")]]))
+        return
+
+    if ctx.user_data.get("awaiting_testimonial"):
+        await capture_testimonial(update, ctx)
+        return
+
     if uid in REVIEWER_IDS and ctx.user_data.get("awaiting_review_score"):
         sid = int(ctx.user_data.get("awaiting_review_score"))
         raw = (msg.text or "").strip()
@@ -3447,6 +3764,7 @@ async def student_private_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE
                       (uid,key,file_id,caption,now().isoformat()))
         ctx.user_data.pop("awaiting_assignment",None)
         await msg.reply_text(f"Your submission for '{key}' has been recorded for review.")
+        await maybe_schedule_first_testimonial(ctx, uid)
         recipients = [ADMIN_GROUP_ID] if ADMIN_GROUP_ID else list(REVIEWER_IDS)
         header = (f"Assignment submission\nStudent: {s['name']} ({s['student_no']})\n"
                   f"Task: {key}\nSubmitted: {now().isoformat()}\nTelegram ID: {uid}")
@@ -3772,6 +4090,7 @@ def admin_dashboard_keyboard():
         [InlineKeyboardButton("📊 Statistics", callback_data="admin:stats"), InlineKeyboardButton("🎁 Free Access", callback_data="admin:freeaccess")],
         [InlineKeyboardButton("🚫 Revoke Free Access", callback_data="admin:revokeaccess")],
         [InlineKeyboardButton("🎥 Recordings", callback_data="rc:menu"), InlineKeyboardButton("📝 Survey Results", callback_data="sv:results")],
+        [InlineKeyboardButton("💬 Testimonials", callback_data="tm:menu")],
         [InlineKeyboardButton("⏰ Class Reminders", callback_data="admin:classreminders"), InlineKeyboardButton("🧠 Weekly Tests", callback_data="admin:tests")],
         [InlineKeyboardButton("🧹 Student Clearance", callback_data="admin:clearance"), InlineKeyboardButton("🆔 Show my Telegram ID", callback_data="admin:myid")],
         [InlineKeyboardButton("📖 Admin Manual", callback_data="admin:manual")],
@@ -3785,6 +4104,7 @@ def reviewer_dashboard_keyboard():
         [InlineKeyboardButton("💬 Support Questions", callback_data="admin:support:0"), InlineKeyboardButton("📣 Group Messages", callback_data="admin:groupmsg")],
         [InlineKeyboardButton("📄 Export PDF", callback_data="admin:export"), InlineKeyboardButton("🆔 My Telegram ID", callback_data="admin:myid")],
         [InlineKeyboardButton("🎥 Recordings", callback_data="rc:menu"), InlineKeyboardButton("📝 Survey Results", callback_data="sv:results")],
+        [InlineKeyboardButton("💬 Testimonials", callback_data="tm:menu")],
         [InlineKeyboardButton("📖 Reviewer Manual", callback_data="admin:manual")],
     ])
 
@@ -4621,6 +4941,8 @@ def build_telegram_application():
     app.add_handler(CommandHandler("removerecording", removerecording_cmd))
     app.add_handler(CallbackQueryHandler(recordings_callback, pattern=r"^rec:list$"))
     app.add_handler(CallbackQueryHandler(survey_callback, pattern=r"^sv:(start|skip|a|results)(:\d+){0,2}$"))
+    app.add_handler(CallbackQueryHandler(testimonial_callback, pattern=r"^tm:(start|skip|perm|menu|list|open|dates|sendnow|sendyes)(:[A-Za-z0-9_-]+){0,2}$"))
+    app.add_handler(MessageHandler(filters.ChatType.PRIVATE & (filters.VOICE | filters.AUDIO | filters.VIDEO_NOTE), testimonial_voice_handler), group=3)
     app.add_handler(CallbackQueryHandler(recording_menu_callback, pattern=r"^rc:(menu|add|list|rm|rmid|rmyes|wk|cancel)(:[A-Za-z0-9-]+)?$"))
     app.add_handler(CommandHandler("exportpdf", export_pdf))
     app.add_handler(CommandHandler("complete", complete_cmd))
@@ -4636,6 +4958,7 @@ def build_telegram_application():
     app.job_queue.run_repeating(check_admin_class_reminders, interval=60, first=15)
     app.job_queue.run_repeating(scheduled_expired_test_check, interval=30, first=20)
     app.job_queue.run_repeating(check_recording_expiry, interval=300, first=40)
+    app.job_queue.run_daily(daily_testimonial_check, time=_parse_hhmm("18:00", "18:00"))
     app.add_error_handler(telegram_error_handler)
     return app
 
